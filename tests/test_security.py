@@ -50,6 +50,7 @@ def test_diagnostic_payload_preserves_structure_and_removes_sensitive_fields():
         "account": "acct_test",
         "client_secret": "seti_secret_value",
         "billing_details": {"email": "owner@example.com", "name": "Owner"},
+        "billing_address": {"line1": "private street", "country": "DE"},
         "next_action": {
             "redirect_to_url": {
                 "url": (
@@ -67,10 +68,12 @@ def test_diagnostic_payload_preserves_structure_and_removes_sensitive_fields():
     assert "requires_approval" in serialized
     assert "seti_secret_value" not in serialized
     assert "owner@example.com" not in serialized
+    assert "private street" not in serialized
     assert "BA-SECRET123" not in serialized
     assert "query-secret" not in serialized
     assert "[REDACTED]" in serialized
     assert set(sanitized["billing_details"]) == {"email", "name"}
+    assert set(sanitized["billing_address"].values()) == {"[REDACTED]"}
 
 
 @pytest.mark.parametrize("raw", ["", "not-a-jwt", "a.b.c"])

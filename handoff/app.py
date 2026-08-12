@@ -8,7 +8,7 @@ from pathlib import Path
 
 from flask import Flask, Response, jsonify, request, send_from_directory, stream_with_context
 
-from .countries import get_country, list_countries
+from .countries import checkout_country_for_proxy, get_country, list_countries
 from .engine import (
     DEFAULT_CHECKOUT_ATTEMPTS,
     DEFAULT_PROVIDER_ATTEMPTS,
@@ -42,21 +42,21 @@ def _masked_email(value: str) -> str:
 
 
 def _parse_shared_run_config(payload: dict) -> dict:
-    checkout_country = get_country(payload.get("checkout_country", ""))
-    promo_country = get_country(payload.get("promo_country", ""))
+    proxy_country = get_country(
+        payload.get("country") or payload.get("proxy_country", "")
+    )
+    checkout_country = checkout_country_for_proxy(proxy_country)
+    proxy_text = payload.get("proxies")
+    if proxy_text is None:
+        proxy_text = payload.get("checkout_proxies")
+    proxy_scheme = payload.get("proxy_scheme") or payload.get("checkout_proxy_scheme")
     return {
+        "proxy_country": proxy_country,
         "checkout_country": checkout_country,
-        "promo_country": promo_country,
-        "checkout_proxies": ProxyPool(
+        "proxies": ProxyPool(
             parse_proxy_lines(
-                _proxy_text(payload.get("checkout_proxies")),
-                default_scheme=str(payload.get("checkout_proxy_scheme") or "socks5"),
-            )
-        ),
-        "promo_proxies": ProxyPool(
-            parse_proxy_lines(
-                _proxy_text(payload.get("promo_proxies")),
-                default_scheme=str(payload.get("promo_proxy_scheme") or "socks5"),
+                _proxy_text(proxy_text),
+                default_scheme=str(proxy_scheme or "socks5"),
             )
         ),
         "checkout_attempts": positive_attempts(
@@ -108,7 +108,7 @@ def _batch_result_url(job: dict) -> str:
         return ""
     return str(
         result.get("paypal_approve_url")
-        or result.get("stripe_redirect_url")
+        or result.get("provider_redirect_url")
         or result.get("checkout_url")
         or ""
     )
@@ -171,8 +171,8 @@ def create_app(config: dict | None = None, *, gateway=None) -> Flask:
                 "countries": list_countries(),
                 "proxy_schemes": list(SUPPORTED_PROXY_SCHEMES),
                 "defaults": {
+                    "country": "BR",
                     "checkout_country": "DE",
-                    "promo_country": "BR",
                     "checkout_attempts": DEFAULT_CHECKOUT_ATTEMPTS,
                     "provider_attempts": DEFAULT_PROVIDER_ATTEMPTS,
                     "batch_concurrency": default_batch_concurrency,
@@ -278,8 +278,7 @@ def create_app(config: dict | None = None, *, gateway=None) -> Flask:
                 "序号",
                 "账号",
                 "状态",
-                "主链路国家",
-                "优惠国家",
+                "国家",
                 "尝试次数",
                 "结果链接",
                 "Checkout Session",
@@ -294,8 +293,7 @@ def create_app(config: dict | None = None, *, gateway=None) -> Flask:
                     job.get("batch_index") or "",
                     job.get("label") or "",
                     job.get("status") or "",
-                    config.get("checkout_country") or "",
-                    config.get("promo_country") or "",
+                    config.get("country") or "",
                     job.get("attempt") or 1,
                     _batch_result_url(job),
                     result.get("session_id") or "",

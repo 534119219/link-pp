@@ -13,6 +13,7 @@ _PROXY_CREDENTIAL_RE = re.compile(r"(?i)(\b(?:socks5h?|https?)://)[^\s/@]+(?::[^
 _BA_RE = re.compile(r"(?i)(ba_token=)(BA-[A-Z0-9-]+)")
 _EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
 _SENSITIVE_DIAGNOSTIC_FIELDS = (
+    "api_key",
     "authorization",
     "client_secret",
     "cookie",
@@ -25,7 +26,13 @@ _SENSITIVE_DIAGNOSTIC_FIELDS = (
     "tax_id",
     "token",
 )
-_REDACT_DIAGNOSTIC_CONTENT_FIELDS = {"address", "billing_details", "metadata", "shipping"}
+_REDACT_DIAGNOSTIC_CONTENT_FIELDS = {
+    "address",
+    "billing_address",
+    "billing_details",
+    "metadata",
+    "shipping",
+}
 
 
 def _is_sensitive_diagnostic_field(field_name: str) -> bool:

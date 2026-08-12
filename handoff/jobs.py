@@ -19,6 +19,8 @@ _CONFIRM_DIAGNOSTICS = (
     ("second_confirm", "二次 confirm 完整响应（已脱敏）"),
     ("confirm", "confirm 完整响应（已脱敏）"),
 )
+_PROTOCOL_DIAGNOSTIC_MARKER = "[protocol-diagnostic] "
+_FLOW_FAILURE_MARKER = "仍未取得 PayPal 链接："
 
 _UI_INFO_MARKERS = (
     "生成 Checkout ",
@@ -26,6 +28,8 @@ _UI_INFO_MARKERS = (
     "未取得 PayPal 链接",
     "approve 返回 blocked",
     "approve 已通过",
+    "Checkout 传输错误",
+    "重建同代理 HTTP 会话",
     "临时限流",
     "等待 Stripe 最终状态",
 )
@@ -35,14 +39,21 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
+def _failure_reason(error: object) -> str:
+    text = str(error or "").strip()
+    marker_at = text.rfind(_FLOW_FAILURE_MARKER)
+    if marker_at >= 0:
+        return text[marker_at + len(_FLOW_FAILURE_MARKER) :].strip()
+    return text
+
+
 def _clone_spec(spec: RunSpec) -> RunSpec:
     return RunSpec(
         access_token=spec.access_token,
         token_profile=spec.token_profile,
+        proxy_country=spec.proxy_country,
         checkout_country=spec.checkout_country,
-        promo_country=spec.promo_country,
-        checkout_proxies=spec.checkout_proxies,
-        promo_proxies=spec.promo_proxies,
+        proxies=spec.proxies,
         checkout_attempts=spec.checkout_attempts,
         provider_attempts=spec.provider_attempts,
         device_id=spec.device_id,
@@ -109,12 +120,13 @@ class Job:
         self.error = ""
         self._spec: RunSpec | None = spec
         self._config = {
+            "country": spec.proxy_country.code,
+            "proxy_country": spec.proxy_country.code,
             "checkout_country": spec.checkout_country.code,
-            "promo_country": spec.promo_country.code,
+            "checkout_currency": spec.checkout_country.currency,
             "checkout_attempts": spec.checkout_attempts,
             "provider_attempts": spec.provider_attempts,
-            "checkout_proxy_count": len(spec.checkout_proxies),
-            "promo_proxy_count": len(spec.promo_proxies),
+            "proxy_count": len(spec.proxies),
         }
         self._cancel = threading.Event()
         self._condition = threading.Condition()
@@ -219,6 +231,20 @@ class Job:
             secrets=secrets,
             max_length=None,
         )
+        marker_at = text.find(_PROTOCOL_DIAGNOSTIC_MARKER)
+        if marker_at >= 0:
+            raw_payload = text[marker_at + len(_PROTOCOL_DIAGNOSTIC_MARKER) :]
+            try:
+                payload = json.loads(raw_payload)
+            except json.JSONDecodeError:
+                return None
+            sanitized_payload = sanitize_diagnostic_payload(payload)
+            kind = "protocol"
+            if isinstance(sanitized_payload, dict):
+                candidate = str(sanitized_payload.get("kind") or "").strip()
+                if candidate:
+                    kind = candidate[:80]
+            return kind, "协议交换完整记录（已脱敏）", sanitized_payload
         for kind, label in _CONFIRM_DIAGNOSTICS:
             marker = f"{label}: "
             marker_at = text.find(marker)
@@ -293,6 +319,7 @@ class Job:
                 "config": dict(self._config),
                 "result": dict(self.result) if self.result else None,
                 "error": self.error or None,
+                "failure_reason": _failure_reason(self.error) or None,
                 "last_seq": self._seq,
             }
 

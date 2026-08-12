@@ -1,8 +1,9 @@
-"""纯协议 Stripe Hosted Checkout（无浏览器）。
+"""ChatGPT Checkout 纯 HTTP 协议。
 
-把 ChatGPT 的 ``cs_live`` checkout session 通过 Stripe HTTP API 推进到「选择 PayPal
-作为 funding source」并 confirm，拿到 Stripe→PayPal 的跳转地址（``pm-redirects.stripe.com
-/authorize/...`` → ``paypal.com/agreements/approve?ba_token=BA-...``）。
+主流程创建 ``oaics_`` 自定义 Checkout，经 ChatGPT taxes、Stripe
+ConfirmationToken 与 Checkout confirm 获取 PayPal 跳转。真正的 ``cpmt_``
+支付方式仍使用 custom_payment_method/start。文件后半保留旧版
+``cs_live_`` Stripe Hosted 辅助函数，供兼容测试和诊断使用，生产网关不再调用。
 
 移植自 Gpt-Agreement-Payment/CTF-pay/card/_monolith.py 的 Stripe 部分：
   fetch_publishable_key / init_checkout / fetch_elements_session /
@@ -26,7 +27,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from ..security import sanitize_diagnostic_payload
+from ..security import sanitize_diagnostic_payload, sanitize_message
 
 STRIPE_API = "https://api.stripe.com"
 STRIPE_VERSION_BASE = "2025-03-31.basil"
@@ -37,8 +38,8 @@ STRIPE_VERSION_FULL = (
 DEFAULT_STRIPE_RUNTIME_VERSION = "6f8494a281"
 CHECKOUT_SESSION_ATTEMPTS_DEFAULT = 3
 CHECKOUT_SESSION_ATTEMPTS_MIN = 1
-PROMO_AMOUNT_VERIFY_ATTEMPTS = 4
-PROMO_AMOUNT_VERIFY_DELAY_SECONDS = 0.8
+ZERO_AMOUNT_VERIFY_ATTEMPTS = 4
+ZERO_AMOUNT_VERIFY_DELAY_SECONDS = 0.8
 
 OPENAI_IE_COUNTRIES = {
     "AT", "BE", "BG", "CH", "CY", "CZ", "DE", "DK", "EE", "ES", "FI",
@@ -48,13 +49,13 @@ OPENAI_IE_COUNTRIES = {
 
 CHROME_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/146.0.7423.118 Safari/537.36"
 )
-CHROME_FULL_VERSION = "136.0.7103.114"
-SEC_CH_UA = '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"'
+CHROME_FULL_VERSION = "146.0.7423.118"
+SEC_CH_UA = '"Chromium";v="146", "Google Chrome";v="146", "Not.A/Brand";v="99"'
 SEC_CH_UA_FULL_VERSION_LIST = (
-    '"Chromium";v="136.0.7103.114", '
-    '"Google Chrome";v="136.0.7103.114", '
+    '"Chromium";v="146.0.7423.118", '
+    '"Google Chrome";v="146.0.7423.118", '
     '"Not.A/Brand";v="99.0.0.0"'
 )
 CHATGPT_CLIENT_VERSION = "prod-db390ebea64862bf1899c420a4c736e0cf639747"
@@ -67,7 +68,11 @@ IP_CHECK_SOURCES = (
 )
 
 OPENAI_CHECKOUT_URL = "https://chatgpt.com/backend-api/payments/checkout"
-OPENAI_CHECKOUT_UPDATE_URL = "https://chatgpt.com/backend-api/payments/checkout/update"
+OPENAI_CHECKOUT_TAXES_URL = f"{OPENAI_CHECKOUT_URL}/taxes"
+OPENAI_CHECKOUT_CONFIRM_URL = f"{OPENAI_CHECKOUT_URL}/confirm"
+OPENAI_CUSTOM_PAYMENT_START_URL = (
+    f"{OPENAI_CHECKOUT_URL}/custom_payment_method/start"
+)
 
 _OAI_SESSION_IDS: dict[str, str] = {}
 _OAI_SESSION_IDS_LOCK = threading.Lock()
@@ -125,14 +130,14 @@ LOCALE_PROFILES = {
 }
 
 class PayPalFundingUnavailableError(RuntimeError):
-    """The concrete Stripe Checkout Session does not accept PayPal."""
+    """The concrete Checkout Session does not accept PayPal."""
 
     def __init__(self, session_id: str, payment_method_types: list[str], detail: str = ""):
         self.session_id = session_id
         self.payment_method_types = list(payment_method_types)
         suffix = f"; {detail}" if detail else ""
         super().__init__(
-            f"Stripe Checkout 不支持 PayPal "
+            f"Checkout 不支持 PayPal "
             f"(session={session_id}, pm={self.payment_method_types}){suffix}"
         )
 
@@ -166,9 +171,24 @@ class PromoNotAppliedError(RuntimeError):
         suffix = f"（{detail}）" if detail else ""
         super().__init__(
             "免费促销未实际生效 "
-            f"(session={session_id}, Stripe due={amount} {self.currency or '?'})；"
+            f"(session={session_id}, Checkout due={amount} {self.currency or '?'})；"
             f"已停止后续 PayPal 创建和审批{suffix}"
         )
+
+
+class OaicsCheckoutRequiredError(RuntimeError):
+    """The custom OAICS flow received a hosted Stripe Checkout instead."""
+
+    def __init__(self, session_id: str):
+        self.session_id = str(session_id or "")
+        super().__init__(
+            "上游返回普通 Stripe Checkout "
+            f"(session={self.session_id or 'unknown'})，未生成当前流程需要的 oaics_ 链"
+        )
+
+
+class OaicsConfirmBlockedError(RuntimeError):
+    """OAICS custom-payment confirmation stayed blocked after fresh proofs."""
 
 
 class CheckoutPreflightError(RuntimeError):
@@ -398,6 +418,10 @@ def _is_retryable_checkout_create_error(error: Optional[str]) -> bool:
     )
 
 
+def _is_checkout_transport_error(error: Optional[str]) -> bool:
+    return str(error or "").strip().lower().startswith("request_error:")
+
+
 def _locale_short(profile: dict) -> str:
     return profile["browser_locale"].split("-")[0]
 
@@ -486,12 +510,21 @@ def _extract_processor_entity(payload: dict) -> str:
     ]
     for value in candidates:
         text = str(value or "")
-        match = re.search(r"/checkout/([^/?]+)/cs_(?:live|test)_[A-Za-z0-9]+", text)
+        match = re.search(
+            r"/checkout/([^/?]+)/(?:oaics|cs_(?:live|test))_[A-Za-z0-9_-]+",
+            text,
+        )
         if match:
             return match.group(1)
         match = re.search(r"processor_entity=([A-Za-z0-9_]+)", text)
         if match:
             return match.group(1)
+    for key in ("checkout_session", "checkout", "session", "data", "result"):
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            found = _extract_processor_entity(nested)
+            if found:
+                return found
     return ""
 
 
@@ -580,10 +613,10 @@ def _warmup_chatgpt_page(
 
 
 def build_http(proxy: Optional[str]):
-    """curl_cffi Session（chrome136 TLS 指纹），使用指定代理。"""
+    """curl_cffi Session（Chrome 146 TLS 指纹），使用指定代理。"""
     from curl_cffi.requests import Session as CffiSession
 
-    http = CffiSession(impersonate="chrome136")
+    http = CffiSession(impersonate="chrome146")
     try:
         http.trust_env = False
     except Exception:
@@ -594,6 +627,96 @@ def build_http(proxy: Optional[str]):
         except Exception:
             pass
     return http
+
+
+def renew_http_session(http, proxy: Optional[str]):
+    """Replace a broken connection pool while preserving the browser cookies."""
+    replacement = build_http(proxy)
+    try:
+        old_cookies = getattr(http, "cookies", None)
+        new_cookies = getattr(replacement, "cookies", None)
+        if old_cookies is not None and new_cookies is not None:
+            new_cookies.update(old_cookies)
+    except Exception:
+        try:
+            replacement.close()
+        except Exception:
+            pass
+        raise
+    try:
+        http.close()
+    except Exception:
+        pass
+    return replacement
+
+
+def _diagnostic_headers(headers: Any) -> dict[str, str]:
+    if not isinstance(headers, dict):
+        return {}
+    allowed = {
+        "cf-ray",
+        "content-type",
+        "openai-processing-ms",
+        "request-id",
+        "retry-after",
+        "server",
+        "x-envoy-upstream-service-time",
+        "x-openai-request-id",
+        "x-request-id",
+    }
+    return {
+        str(key).lower(): str(value)[:500]
+        for key, value in headers.items()
+        if str(key).lower() in allowed
+    }
+
+
+def _diagnostic_response_payload(response: Any) -> Any:
+    text = str(getattr(response, "text", "") or "")
+    try:
+        return response.json()
+    except Exception:
+        try:
+            return json.loads(text or "{}")
+        except ValueError:
+            return {"raw_text": text[:16000], "raw_text_truncated": len(text) > 16000}
+
+
+def _protocol_diagnostic(
+    log: Callable[[str], None],
+    *,
+    kind: str,
+    method: str,
+    route: str,
+    status: Any = 0,
+    request_payload: Any = None,
+    response_payload: Any = None,
+    response: Any = None,
+    error: Any = "",
+) -> None:
+    """Emit one backend-only record; Job strips it from UI/SSE output."""
+    record: dict[str, Any] = {
+        "kind": str(kind or "protocol")[:80],
+        "method": str(method or "").upper(),
+        "route": str(route or ""),
+        "http_status": int(status or 0),
+    }
+    if request_payload is not None:
+        record["request"] = sanitize_diagnostic_payload(request_payload)
+    if response_payload is not None:
+        record["response"] = sanitize_diagnostic_payload(response_payload)
+    response_headers = _diagnostic_headers(getattr(response, "headers", {}) or {})
+    if response_headers:
+        record["response_headers"] = response_headers
+    if error:
+        record["error"] = sanitize_diagnostic_payload(
+            str(error)[:4000],
+            field_name="error",
+        )
+    log(
+        "[protocol-diagnostic] "
+        + json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -612,7 +735,7 @@ def create_chatgpt_order(
     with_promo: bool = True,
     log: Callable[[str], None] = lambda m: None,
 ) -> tuple[Optional[str], Optional[str]]:
-    """POST /backend-api/payments/checkout 创建订单，返回 (cs_live_session_id, error)。"""
+    """POST Checkout once and return the OAICS or hosted session identifier."""
     if checkout_context is not None:
         checkout_context.clear()
     _set_oai_device_cookie(http, device_id)
@@ -631,6 +754,8 @@ def create_chatgpt_order(
         "Content-Type": "application/json",
         "Accept": "*/*",
         "Origin": "https://chatgpt.com",
+        "x-openai-target-path": "/backend-api/payments/checkout",
+        "x-openai-target-route": "/backend-api/payments/checkout",
         **chatgpt_context_headers(
             country=country,
             device_id=device_id,
@@ -661,6 +786,7 @@ def create_chatgpt_order(
             "country": (country or "US").upper(),
             "currency": (currency or "USD").upper(),
         },
+        "checkout_ui_mode": "custom",
     }
     body["check_card_proxy"] = True
     if with_promo:
@@ -672,20 +798,53 @@ def create_chatgpt_order(
     try:
         resp = http.post(OPENAI_CHECKOUT_URL, json=body, headers=headers, timeout=30)
     except Exception as e:
+        _protocol_diagnostic(
+            log,
+            kind="checkout_create",
+            method="POST",
+            route="/backend-api/payments/checkout",
+            request_payload=body,
+            error=f"{type(e).__name__}: {e}",
+        )
         return None, f"request_error: {type(e).__name__}: {e}"
 
     status = getattr(resp, "status_code", 0)
     text = getattr(resp, "text", "") or ""
+    diagnostic_payload = _diagnostic_response_payload(resp)
+    _protocol_diagnostic(
+        log,
+        kind="checkout_create",
+        method="POST",
+        route="/backend-api/payments/checkout",
+        status=status,
+        request_payload=body,
+        response_payload=diagnostic_payload,
+        response=resp,
+    )
     if status != 200:
         return None, f"HTTP {status}: {text[:300]}"
     try:
-        data = json.loads(text or "{}")
+        data = diagnostic_payload
     except ValueError:
         return None, f"invalid_json: {text[:200]}"
-    sid = data.get("checkout_session_id")
-    if not sid:
-        mm = re.search(r"cs_live_[A-Za-z0-9]+", text)
-        sid = mm.group(0) if mm else None
+    if not isinstance(data, dict):
+        return None, f"invalid_json_object: {text[:200]}"
+    raw_sid = str(data.get("checkout_session_id") or "")
+    searchable = "\n".join(
+        (
+            raw_sid,
+            str(data.get("checkout_url") or ""),
+            str(data.get("url") or ""),
+            str(data.get("openai_checkout_url") or ""),
+            text,
+        )
+    )
+    # OAICS is the required application Checkout. Prefer it even when a nested
+    # hosted Stripe identifier is also present in the response.
+    match = re.search(r"oaics_[A-Za-z0-9_-]+", searchable)
+    if match is None:
+        match = re.search(r"cs_(?:live|test)_[A-Za-z0-9_-]+", searchable)
+    sid = match.group(0) if match else None
     if sid:
         if checkout_context is not None:
             checkout_context["processor_entity"] = (
@@ -708,6 +867,9 @@ def create_chatgpt_order(
             pk_match = re.search(r"pk_live_[A-Za-z0-9]+", str(raw_pk))
             if pk_match:
                 checkout_context["publishable_key"] = pk_match.group(0)
+            checkout_context["checkout_kind"] = (
+                "oaics" if sid.startswith("oaics_") else "hosted"
+            )
         return sid, None
     return None, f"no_session_id: {text[:200]}"
 
@@ -724,6 +886,7 @@ def create_chatgpt_order_with_retry(
     with_promo: bool = True,
     max_attempts: Any = CHECKOUT_SESSION_ATTEMPTS_DEFAULT,
     is_cancelled: Optional[Callable[[], bool]] = None,
+    renew_http: Optional[Callable[[Any], Any]] = None,
     log: Callable[[str], None] = lambda m: None,
 ) -> tuple[Optional[str], Optional[str]]:
     """Create one Checkout Session, retrying only transient creation failures."""
@@ -750,6 +913,29 @@ def create_chatgpt_order_with_retry(
         if attempt >= attempts or not _is_retryable_checkout_create_error(error):
             break
 
+        if _is_checkout_transport_error(error):
+            log(
+                "[order] Checkout 传输错误（已脱敏）: "
+                + sanitize_message(
+                    error,
+                    access_token=access_token,
+                    max_length=320,
+                )
+            )
+            if renew_http is not None:
+                try:
+                    http = renew_http(http)
+                    log("[order] 已保留 Cookie 并重建同代理 HTTP 会话")
+                except Exception as exc:
+                    log(
+                        "[order] HTTP 会话重建失败（继续重试）: "
+                        + sanitize_message(
+                            f"{type(exc).__name__}: {exc}",
+                            access_token=access_token,
+                            max_length=220,
+                        )
+                    )
+
         delay = min(1.5 * (2 ** (attempt - 1)) + random.uniform(0.1, 0.5), 6.0)
         status_match = re.search(r"\bHTTP\s+(\d{3})\b", str(error or ""), re.IGNORECASE)
         reason = f"HTTP {status_match.group(1)}" if status_match else "网络异常"
@@ -762,100 +948,1172 @@ def create_chatgpt_order_with_retry(
     return None, last_error
 
 
-def update_chatgpt_checkout_promotion(
-    http,
+# ---------------------------------------------------------------------------
+# OAICS custom Checkout（纯 HTTP）
+# ---------------------------------------------------------------------------
+
+_OAICS_WRAPPER_KEYS = (
+    "checkout_session",
+    "checkoutSession",
+    "session",
+    "checkout",
+    "data",
+    "result",
+    "payload",
+    "response",
+    "checkout_state",
+    "checkoutState",
+    "checkout_snapshot",
+    "checkoutSnapshot",
+)
+
+_OAICS_AMOUNT_PATHS = (
+    ("checkout_amount_minor",),
+    ("total_summary", "due"),
+    ("totalSummary", "due"),
+    ("invoice", "amount_due"),
+    ("invoice", "amountDue"),
+    ("amount_due",),
+    ("amountDue",),
+    ("amount_total",),
+    ("amountTotal",),
+    ("total", "total"),
+    ("total", "due"),
+    ("total", "taxInclusive"),
+    ("total", "taxInclusiveAmount"),
+)
+
+
+def _response_json(response: Any, stage: str) -> dict[str, Any]:
+    text = str(getattr(response, "text", "") or "")
+    try:
+        payload = response.json()
+    except Exception:
+        try:
+            payload = json.loads(text or "{}")
+        except ValueError as exc:
+            raise RuntimeError(f"{stage} 返回非 JSON：{text[:300]}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{stage} 返回无效 JSON 对象")
+    return payload
+
+
+def _oaics_headers(
     access_token: str,
-    session_id: str,
     *,
-    processor_entity: str,
     country: str,
-    device_id: str = "",
-    billing_country: str = "",
-    billing_currency: str = "",
-    promo_campaign_id: str = "plus-1-month-free",
-    max_attempts: int = 3,
-    log: Callable[[str], None] = lambda m: None,
-) -> dict:
-    """Apply the promotion, retrying only transient transport/server failures."""
-    _set_oai_device_cookie(http, device_id)
-    path = "/backend-api/payments/checkout/update"
+    device_id: str,
+    referer: str,
+    route: str = "",
+) -> dict[str, str]:
     headers = {
         "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-        "Accept": "*/*",
+        "Accept": "application/json",
         "Origin": "https://chatgpt.com",
-        "x-openai-target-path": path,
-        "x-openai-target-route": path,
         **chatgpt_context_headers(
             country=country,
             device_id=device_id,
-            referer=f"https://chatgpt.com/checkout/{processor_entity}/{session_id}",
+            referer=referer,
         ),
     }
-    body: dict[str, Any] = {
+    if route:
+        headers["x-openai-target-path"] = route
+        headers["x-openai-target-route"] = route
+    return headers
+
+
+def fetch_oaics_checkout_session(
+    http,
+    access_token: str,
+    session_id: str,
+    processor_entity: str,
+    *,
+    country: str,
+    device_id: str,
+    log: Callable[[str], None] = lambda _message: None,
+) -> dict[str, Any]:
+    if not str(session_id or "").startswith("oaics_"):
+        raise OaicsCheckoutRequiredError(session_id)
+    checkout_url = f"https://chatgpt.com/checkout/{processor_entity}/{session_id}"
+    route = "/backend-api/payments/checkout/{processor_entity}/{checkout_session_id}"
+    request_summary = {
         "checkout_session_id": session_id,
         "processor_entity": processor_entity,
-        "plan_name": "chatgptplusplan",
-        "price_interval": "month",
-        "seat_quantity": 1,
+        "country": str(country or "").upper(),
     }
-    bill_country = str(billing_country or "").strip().upper()
-    bill_currency = str(billing_currency or "").strip().upper()
-    if bill_country and bill_currency:
-        body["billing_details"] = {
-            "country": bill_country,
-            "currency": bill_currency,
-        }
-    promo = str(promo_campaign_id or "").strip()
-    if promo:
-        body["promo_campaign"] = {
-            "promo_campaign_id": promo,
-            "is_coupon_from_query_param": False,
-        }
-    attempts = max(1, int(max_attempts))
-    response = None
-    for attempt in range(1, attempts + 1):
-        try:
-            response = http.post(
-                OPENAI_CHECKOUT_UPDATE_URL,
-                json=body,
-                headers=headers,
-                timeout=30,
-            )
-        except Exception as exc:
-            error = f"request_error: {type(exc).__name__}: {exc}"
-            if attempt >= attempts or not _is_retryable_checkout_create_error(error):
-                raise RuntimeError(
-                    f"ChatGPT 优惠更新请求失败: {type(exc).__name__}: {exc}"
-                ) from exc
-            status = 0
-        else:
-            status = int(getattr(response, "status_code", 0) or 0)
-            if status == 200:
-                break
-            if attempt >= attempts or status not in {408, 425, 429} and status < 500:
-                text = getattr(response, "text", "") or ""
-                raise RuntimeError(f"ChatGPT 优惠更新失败: HTTP {status}: {text[:300]}")
-        delay = min(1.5 * (2 ** (attempt - 1)) + random.uniform(0.1, 0.5), 6.0)
-        reason = f"HTTP {status}" if status else "网络异常"
-        log(f"[promo] 优惠更新遇到临时限流，{delay:.1f}s 后重试 {attempt + 1}/{attempts}（{reason}）")
-        time.sleep(delay)
-
-    if response is None:
-        raise RuntimeError("ChatGPT 优惠更新失败: 未取得响应")
-    text = getattr(response, "text", "") or ""
     try:
-        payload = response.json() or {}
+        response = http.get(
+            f"{OPENAI_CHECKOUT_URL}/{processor_entity}/{session_id}",
+            headers=_oaics_headers(
+                access_token,
+                country=country,
+                device_id=device_id,
+                referer=checkout_url,
+                route=route,
+            ),
+            timeout=45,
+        )
     except Exception as exc:
-        raise RuntimeError(f"ChatGPT 优惠更新返回无效 JSON: {text[:200]}") from exc
-    if isinstance(payload, dict) and payload.get("success") is False:
-        raise RuntimeError(f"ChatGPT 优惠更新被拒绝: {json.dumps(payload, ensure_ascii=False)[:300]}")
-    billing_tag = f"{bill_country}/{bill_currency}" if bill_country and bill_currency else "default"
-    log(
-        f"[promo] 已在优惠代理上更新同一订单"
-        f"（session={session_id}, billing={billing_tag}）"
+        _protocol_diagnostic(
+            log,
+            kind="checkout_state",
+            method="GET",
+            route=route,
+            request_payload=request_summary,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise
+    status = int(getattr(response, "status_code", 0) or 0)
+    text = str(getattr(response, "text", "") or "")
+    response_payload = _diagnostic_response_payload(response)
+    _protocol_diagnostic(
+        log,
+        kind="checkout_state",
+        method="GET",
+        route=route,
+        status=status,
+        request_payload=request_summary,
+        response_payload=response_payload,
+        response=response,
     )
-    return payload if isinstance(payload, dict) else {"result": payload}
+    if status == 401:
+        raise ChatGPTAuthError("读取 OAICS Checkout 失败 HTTP 401")
+    if status != 200:
+        raise RuntimeError(f"读取 OAICS Checkout 失败 HTTP {status}: {text[:300]}")
+    return _response_json(response, "读取 OAICS Checkout")
+
+
+def submit_oaics_checkout_taxes(
+    http,
+    access_token: str,
+    session_id: str,
+    processor_entity: str,
+    *,
+    billing: dict[str, Any],
+    country: str,
+    currency: str,
+    device_id: str,
+    log: Callable[[str], None] = lambda _message: None,
+) -> dict[str, Any]:
+    normalized_country = str(country or "").upper()
+    normalized_currency = str(currency or "").upper()
+    source_address = billing.get("address") if isinstance(billing, dict) else {}
+    source_address = source_address if isinstance(source_address, dict) else {}
+    address = {
+        "country": normalized_country,
+        "line1": str(source_address.get("line1") or ""),
+        "line2": str(source_address.get("line2") or ""),
+        "city": str(source_address.get("city") or ""),
+        "state": str(source_address.get("state") or ""),
+        "postal_code": str(source_address.get("postal_code") or ""),
+    }
+    checkout_url = f"https://chatgpt.com/checkout/{processor_entity}/{session_id}"
+    route = "/backend-api/payments/checkout/taxes"
+    body = {
+        "checkout_session_id": session_id,
+        "checkout_email": str(billing.get("email") or ""),
+        "billing_country": normalized_country,
+        "billing_name": str(billing.get("name") or ""),
+        "currency": normalized_currency,
+        "tax_id": str(billing.get("tax_id") or "") or None,
+        "processor_entity": processor_entity,
+        "billing_address": address,
+    }
+    try:
+        response = http.post(
+            OPENAI_CHECKOUT_TAXES_URL,
+            json=body,
+            headers={
+                **_oaics_headers(
+                    access_token,
+                    country=normalized_country,
+                    device_id=device_id,
+                    referer=checkout_url,
+                    route=route,
+                ),
+                "Content-Type": "application/json",
+            },
+            timeout=50,
+        )
+    except Exception as exc:
+        _protocol_diagnostic(
+            log,
+            kind="checkout_taxes",
+            method="POST",
+            route=route,
+            request_payload=body,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise
+    status = int(getattr(response, "status_code", 0) or 0)
+    text = str(getattr(response, "text", "") or "")
+    _protocol_diagnostic(
+        log,
+        kind="checkout_taxes",
+        method="POST",
+        route=route,
+        status=status,
+        request_payload=body,
+        response_payload=_diagnostic_response_payload(response),
+        response=response,
+    )
+    if status == 401:
+        raise ChatGPTAuthError("提交 OAICS 账单失败 HTTP 401")
+    if status != 200:
+        raise RuntimeError(f"提交 OAICS 账单失败 HTTP {status}: {text[:300]}")
+    return _response_json(response, "提交 OAICS 账单")
+
+
+def _nested_value(payload: Any, path: tuple[str, ...]) -> Any:
+    current = payload
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _oaics_money_minor(value: Any) -> Optional[int]:
+    if isinstance(value, dict):
+        for key in ("minorUnitsAmount", "minor_units_amount", "amount"):
+            if value.get(key) is not None:
+                return _oaics_money_minor(value.get(key))
+        return None
+    return _minor_amount(value)
+
+
+def oaics_amount_observations(payload: Any) -> list[tuple[str, int]]:
+    """Return payable amount fields without treating undiscounted unit prices as due."""
+    observations: list[tuple[str, int]] = []
+    visited: set[int] = set()
+
+    def visit(value: Any, prefix: str = "") -> None:
+        if not isinstance(value, dict) or id(value) in visited:
+            return
+        visited.add(id(value))
+        for path in _OAICS_AMOUNT_PATHS:
+            raw = _nested_value(value, path)
+            amount = _oaics_money_minor(raw)
+            if amount is not None:
+                label = ".".join(path)
+                observations.append((f"{prefix}{label}", amount))
+        for key in _OAICS_WRAPPER_KEYS:
+            nested = value.get(key)
+            if isinstance(nested, dict):
+                visit(nested, f"{prefix}{key}.")
+
+    visit(payload)
+    return list(dict.fromkeys(observations))
+
+
+def oaics_checkout_currency(payload: Any) -> str:
+    visited: set[int] = set()
+
+    def find(value: Any) -> str:
+        if not isinstance(value, dict) or id(value) in visited:
+            return ""
+        visited.add(id(value))
+        for key in ("currency", "currency_code", "currencyCode"):
+            candidate = str(value.get(key) or "").strip().upper()
+            if re.fullmatch(r"[A-Z]{3}", candidate):
+                return candidate
+        for key in (*_OAICS_WRAPPER_KEYS, "total", "total_summary", "totalSummary"):
+            candidate = find(value.get(key))
+            if candidate:
+                return candidate
+        return ""
+
+    return find(payload)
+
+
+def verify_oaics_zero_snapshot(
+    payload: Any,
+    *,
+    session_id: str,
+    currency: str,
+) -> int:
+    observations = oaics_amount_observations(payload)
+    if not observations:
+        raise PromoNotAppliedError(
+            session_id,
+            "unknown",
+            oaics_checkout_currency(payload) or currency,
+            "OAICS 未返回可核验的应付金额",
+        )
+    nonzero = [(label, amount) for label, amount in observations if amount != 0]
+    if nonzero:
+        detail = ", ".join(f"{label}={amount}" for label, amount in nonzero)
+        raise PromoNotAppliedError(
+            session_id,
+            nonzero[0][1],
+            oaics_checkout_currency(payload) or currency,
+            detail,
+        )
+    return 0
+
+
+def wait_for_oaics_zero(
+    http,
+    access_token: str,
+    session_id: str,
+    processor_entity: str,
+    *,
+    country: str,
+    currency: str,
+    device_id: str,
+    initial_payload: Optional[dict[str, Any]] = None,
+    attempts: int = ZERO_AMOUNT_VERIFY_ATTEMPTS,
+    log: Callable[[str], None] = lambda _message: None,
+) -> dict[str, Any]:
+    payload = initial_payload or {}
+    last_error: PromoNotAppliedError | None = None
+    for attempt in range(1, max(1, attempts) + 1):
+        if not payload or attempt > 1:
+            payload = fetch_oaics_checkout_session(
+                http,
+                access_token,
+                session_id,
+                processor_entity,
+                country=country,
+                device_id=device_id,
+                log=log,
+            )
+        try:
+            verify_oaics_zero_snapshot(
+                payload,
+                session_id=session_id,
+                currency=currency,
+            )
+            log(f"[oaics] 0 元订单已确认（session={session_id}）")
+            return payload
+        except PromoNotAppliedError as exc:
+            last_error = exc
+            if attempt < max(1, attempts):
+                log(
+                    f"[oaics] 等待 0 元状态同步 "
+                    f"{attempt + 1}/{max(1, attempts)}"
+                )
+                time.sleep(ZERO_AMOUNT_VERIFY_DELAY_SECONDS)
+    assert last_error is not None
+    raise last_error
+
+
+def _walk_dicts(value: Any):
+    if isinstance(value, dict):
+        yield value
+        for nested in value.values():
+            yield from _walk_dicts(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _walk_dicts(nested)
+
+
+def oaics_custom_payment_methods(payload: Any) -> list[dict[str, Any]]:
+    methods: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in _walk_dicts(payload):
+        candidates = item.get("custom_payment_methods")
+        if candidates is None:
+            candidates = item.get("customPaymentMethods")
+        if not isinstance(candidates, list):
+            continue
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            method_id = str(candidate.get("id") or "").strip()
+            if not method_id.startswith("cpmt_") or method_id in seen:
+                continue
+            seen.add(method_id)
+            methods.append(candidate)
+    methods.sort(
+        key=lambda item: (
+            0
+            if "paypal" in json.dumps(item, ensure_ascii=True).lower()
+            else 1
+        )
+    )
+    return methods
+
+
+def oaics_payment_method_types(payload: Any) -> list[str]:
+    methods: list[str] = []
+    seen: set[str] = set()
+    for item in _walk_dicts(payload):
+        candidates = item.get("payment_method_types")
+        if candidates is None:
+            candidates = item.get("paymentMethodTypes")
+        if not isinstance(candidates, list):
+            continue
+        for candidate in candidates:
+            if isinstance(candidate, dict):
+                candidate = candidate.get("type")
+            method = str(candidate or "").strip().lower()
+            if method and method not in seen:
+                seen.add(method)
+                methods.append(method)
+    return methods
+
+
+def _oaics_find_string(
+    payload: Any,
+    names: tuple[str, ...],
+    *,
+    prefixes: tuple[str, ...] = (),
+) -> str:
+    for item in _walk_dicts(payload):
+        for name in names:
+            candidate = item.get(name)
+            if not isinstance(candidate, str):
+                continue
+            value = candidate.strip()
+            if value and (not prefixes or value.startswith(prefixes)):
+                return value
+    return ""
+
+
+def create_oaics_elements_session(
+    http,
+    state: dict[str, Any],
+    *,
+    country: str,
+    currency: str,
+    log: Callable[[str], None] = lambda _message: None,
+) -> dict[str, Any]:
+    publishable_key = str(state.get("publishable_key") or "").strip()
+    customer_secret = str(state.get("customer_session_client_secret") or "").strip()
+    if not publishable_key.startswith(("pk_live_", "pk_test_")):
+        raise RuntimeError("OAICS PayPal 缺少 Stripe publishable_key")
+    if not customer_secret:
+        raise RuntimeError("OAICS PayPal 缺少 customer_session_client_secret")
+    methods = oaics_payment_method_types(state)
+    stripe_js_id = str(uuid.uuid4())
+    params = {
+        "customer_session_client_secret": customer_secret,
+        "client_betas[0]": "custom_checkout_server_updates_1",
+        "client_betas[1]": "custom_checkout_manual_approval_1",
+        "deferred_intent[mode]": "subscription",
+        "deferred_intent[amount]": "0",
+        "deferred_intent[currency]": str(currency or "").lower(),
+        "deferred_intent[setup_future_usage]": "off_session",
+        "currency": str(currency or "").lower(),
+        "key": publishable_key,
+        "_stripe_version": STRIPE_VERSION_FULL,
+        "elements_init_source": "stripe.elements",
+        "referrer_host": "chatgpt.com",
+        "stripe_js_id": stripe_js_id,
+        "locale": _profile(country)["browser_locale"],
+        "type": "deferred_intent",
+    }
+    for index, method in enumerate(methods):
+        params[f"deferred_intent[payment_method_types][{index}]"] = method
+    route = "/v1/elements/sessions"
+    try:
+        response = http.get(
+            f"{STRIPE_API}{route}",
+            params=params,
+            headers=_stripe_headers(),
+            timeout=40,
+        )
+    except Exception as exc:
+        _protocol_diagnostic(
+            log,
+            kind="stripe_elements_session",
+            method="GET",
+            route=route,
+            request_payload=params,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise
+    status = int(getattr(response, "status_code", 0) or 0)
+    response_payload = _diagnostic_response_payload(response)
+    _protocol_diagnostic(
+        log,
+        kind="stripe_elements_session",
+        method="GET",
+        route=route,
+        status=status,
+        request_payload=params,
+        response_payload=response_payload,
+        response=response,
+    )
+    if status != 200:
+        raise RuntimeError(f"OAICS PayPal Elements Session 失败 HTTP {status}")
+    payload = _response_json(response, "初始化 OAICS PayPal Elements Session")
+    payload["_oaics_publishable_key"] = publishable_key
+    payload["_oaics_stripe_js_id"] = stripe_js_id
+    payload["_oaics_payment_method_types"] = methods
+    return payload
+
+
+def create_oaics_paypal_confirmation_token(
+    http,
+    state: dict[str, Any],
+    elements: dict[str, Any],
+    *,
+    billing: dict[str, Any],
+    currency: str,
+    log: Callable[[str], None] = lambda _message: None,
+) -> str:
+    publishable_key = str(elements.get("_oaics_publishable_key") or "").strip()
+    stripe_js_id = str(elements.get("_oaics_stripe_js_id") or uuid.uuid4())
+    elements_session_id = _oaics_find_string(
+        elements,
+        ("session_id", "sessionId", "id"),
+        prefixes=("elements_session_",),
+    )
+    elements_config_id = _oaics_find_string(
+        elements,
+        ("config_id", "elements_session_config_id", "elementsSessionConfigId"),
+    )
+    customer = _oaics_find_string(
+        elements,
+        ("customer", "customer_id", "customerId"),
+        prefixes=("cus_",),
+    )
+    methods = list(elements.get("_oaics_payment_method_types") or [])
+    address = billing.get("address") if isinstance(billing, dict) else {}
+    address = address if isinstance(address, dict) else {}
+    guid, muid, sid = _gen_fingerprint()
+    runtime_version = DEFAULT_STRIPE_RUNTIME_VERSION
+    body: dict[str, Any] = {
+        "payment_method_data[type]": "paypal",
+        "payment_method_data[billing_details][name]": str(billing.get("name") or ""),
+        "payment_method_data[billing_details][email]": str(billing.get("email") or ""),
+        "payment_method_data[guid]": guid,
+        "payment_method_data[muid]": muid,
+        "payment_method_data[sid]": sid,
+        "payment_method_data[payment_user_agent]": (
+            f"stripe.js/{runtime_version}; stripe-js-v3/{runtime_version}; "
+            "payment-element; deferred-intent"
+        ),
+        "payment_method_data[referrer]": "https://chatgpt.com",
+        "payment_method_data[time_on_page]": str(random.randint(25000, 55000)),
+        "setup_future_usage": "off_session",
+        "set_as_default_payment_method": "false",
+        "mandate_data[customer_acceptance][type]": "online",
+        "mandate_data[customer_acceptance][online][infer_from_client]": "true",
+        "client_context[currency]": str(currency or "").lower(),
+        "client_context[mode]": "subscription",
+        "client_attribution_metadata[client_session_id]": stripe_js_id,
+        "client_attribution_metadata[merchant_integration_source]": "elements",
+        "client_attribution_metadata[merchant_integration_subtype]": "payment-element",
+        "client_attribution_metadata[merchant_integration_version]": "2021",
+        "client_attribution_metadata[payment_intent_creation_flow]": "deferred",
+        "client_attribution_metadata[payment_method_selection_flow]": "automatic",
+        "client_attribution_metadata[merchant_integration_additional_elements][0]": "expressCheckout",
+        "client_attribution_metadata[merchant_integration_additional_elements][1]": "payment",
+        "client_attribution_metadata[merchant_integration_additional_elements][2]": "address",
+        "key": publishable_key,
+    }
+    for field in ("line1", "line2", "city", "state", "postal_code", "country"):
+        value = str(address.get(field) or "")
+        if value:
+            body[f"payment_method_data[billing_details][address][{field}]"] = value
+    for index, method in enumerate(methods):
+        body[f"client_context[payment_method_types][{index}]"] = method
+    if customer:
+        body["client_context[customer]"] = customer
+    for prefix in (
+        "client_attribution_metadata",
+        "payment_method_data[client_attribution_metadata]",
+    ):
+        if elements_session_id:
+            body[f"{prefix}[elements_session_id]"] = elements_session_id
+        if elements_config_id:
+            body[f"{prefix}[elements_session_config_id]"] = elements_config_id
+    route = "/v1/confirmation_tokens"
+    headers = {
+        **_stripe_headers(),
+        # A customer ephemeral key can only reference existing saved methods.
+        # Creating a new PayPal payment_method_data token uses the merchant PK.
+        "Authorization": f"Bearer {publishable_key}",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Stripe-Version": STRIPE_VERSION_FULL,
+    }
+    try:
+        response = http.post(
+            f"{STRIPE_API}{route}",
+            data=body,
+            headers=headers,
+            timeout=40,
+        )
+    except Exception as exc:
+        _protocol_diagnostic(
+            log,
+            kind="stripe_confirmation_token",
+            method="POST",
+            route=route,
+            request_payload=body,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise
+    status = int(getattr(response, "status_code", 0) or 0)
+    response_payload = _diagnostic_response_payload(response)
+    _protocol_diagnostic(
+        log,
+        kind="stripe_confirmation_token",
+        method="POST",
+        route=route,
+        status=status,
+        request_payload=body,
+        response_payload=response_payload,
+        response=response,
+    )
+    if status != 200:
+        error = response_payload.get("error") if isinstance(response_payload, dict) else {}
+        error = error if isinstance(error, dict) else {}
+        detail = str(error.get("code") or error.get("type") or "").strip()
+        suffix = f" ({detail})" if detail else ""
+        raise RuntimeError(f"OAICS PayPal ConfirmationToken 失败 HTTP {status}{suffix}")
+    payload = _response_json(response, "创建 OAICS PayPal ConfirmationToken")
+    confirmation_token = _oaics_find_string(
+        payload,
+        ("id", "confirmation_token", "confirmationToken"),
+        prefixes=("ctoken_", "ct_"),
+    )
+    if not confirmation_token:
+        raise RuntimeError("OAICS PayPal ConfirmationToken 响应缺少 token")
+    return confirmation_token
+
+
+def confirm_oaics_standard_paypal(
+    http,
+    access_token: str,
+    session_id: str,
+    processor_entity: str,
+    confirmation_token: str,
+    *,
+    country: str,
+    device_id: str,
+    sentinel_proxy: str,
+    log: Callable[[str], None] = lambda _message: None,
+) -> dict[str, Any]:
+    checkout_url = f"https://chatgpt.com/checkout/{processor_entity}/{session_id}"
+    route = "/backend-api/payments/checkout/confirm"
+    headers = {
+        **_oaics_headers(
+            access_token,
+            country=country,
+            device_id=device_id,
+            referer=checkout_url,
+            route=route,
+        ),
+        "Content-Type": "application/json",
+    }
+    sentinel, sentinel_so = _mint_sentinel(
+        "checkout_session_approval",
+        SentinelCtx(
+            device_id=device_id,
+            user_agent=CHROME_UA,
+            proxy=sentinel_proxy,
+            country=country,
+            page_url=checkout_url,
+            cookie_header=_session_cookie_header(http),
+        ),
+        log,
+    )
+    if sentinel:
+        headers["OpenAI-Sentinel-Token"] = sentinel
+    if sentinel_so:
+        headers["OpenAI-Sentinel-SO-Token"] = sentinel_so
+    body = {
+        "checkout_session_id": session_id,
+        "confirm_token": confirmation_token,
+        "selected_payment_method_type": "paypal",
+    }
+    try:
+        response = http.post(
+            OPENAI_CHECKOUT_CONFIRM_URL,
+            json=body,
+            headers=headers,
+            timeout=50,
+        )
+    except Exception as exc:
+        _protocol_diagnostic(
+            log,
+            kind="checkout_confirm",
+            method="POST",
+            route=route,
+            request_payload=body,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    response_payload = _diagnostic_response_payload(response)
+    _protocol_diagnostic(
+        log,
+        kind="checkout_confirm",
+        method="POST",
+        route=route,
+        status=status_code,
+        request_payload=body,
+        response_payload=response_payload,
+        response=response,
+    )
+    if status_code == 401:
+        raise ChatGPTAuthError("OAICS PayPal confirm 失败 HTTP 401")
+    if status_code != 200:
+        raise RuntimeError(f"OAICS PayPal confirm 失败 HTTP {status_code}")
+    payload = _response_json(response, "确认 OAICS PayPal")
+    status = str(payload.get("status") or "").strip().lower()
+    if status == "blocked":
+        raise OaicsConfirmBlockedError("OAICS PayPal confirm blocked")
+    if not status:
+        raise RuntimeError("OAICS PayPal confirm 响应缺少 status")
+    if status in {"declined", "failed", "error", "requires_action"}:
+        raise RuntimeError(f"OAICS PayPal confirm 失败 status={status}")
+    return payload
+
+
+def confirm_oaics_paypal_intent(
+    http,
+    confirmation_token: str,
+    app_confirm: dict[str, Any],
+    elements: dict[str, Any],
+    *,
+    log: Callable[[str], None] = lambda _message: None,
+) -> dict[str, Any]:
+    publishable_key = str(elements.get("_oaics_publishable_key") or "").strip()
+    intent_type = str(app_confirm.get("type") or "").strip().lower()
+    client_secret = str(app_confirm.get("client_secret") or "").strip()
+    if "_secret_" not in client_secret:
+        raise RuntimeError("OAICS PayPal confirm 未返回 Intent client_secret")
+    intent_id = client_secret.split("_secret_", 1)[0]
+    if intent_id.startswith("pi_"):
+        expected_type, collection = "payment_intent", "payment_intents"
+    elif intent_id.startswith("seti_"):
+        expected_type, collection = "setup_intent", "setup_intents"
+    else:
+        raise RuntimeError("OAICS PayPal confirm 返回了未知 Intent")
+    if intent_type and intent_type != expected_type:
+        raise RuntimeError("OAICS PayPal confirm 返回的 Intent 类型不一致")
+    body = {
+        "confirmation_token": confirmation_token,
+        "client_secret": client_secret,
+        "use_stripe_sdk": "true",
+        "key": publishable_key,
+    }
+    return_url = str(app_confirm.get("confirm_return_url") or "").strip()
+    if return_url:
+        body["return_url"] = return_url
+    route = f"/v1/{collection}/{intent_id}/confirm"
+    headers = {
+        **_stripe_headers(),
+        "Authorization": f"Bearer {publishable_key}",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Stripe-Version": STRIPE_VERSION_FULL,
+    }
+    try:
+        response = http.post(
+            f"{STRIPE_API}{route}",
+            data=body,
+            headers=headers,
+            timeout=50,
+        )
+    except Exception as exc:
+        _protocol_diagnostic(
+            log,
+            kind="stripe_intent_confirm",
+            method="POST",
+            route=route,
+            request_payload=body,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    response_payload = _diagnostic_response_payload(response)
+    _protocol_diagnostic(
+        log,
+        kind="stripe_intent_confirm",
+        method="POST",
+        route=route,
+        status=status_code,
+        request_payload=body,
+        response_payload=response_payload,
+        response=response,
+    )
+    if isinstance(response_payload, dict):
+        _raise_for_current_paypal_risk_decline(response_payload, "")
+    if status_code != 200:
+        error = response_payload.get("error") if isinstance(response_payload, dict) else {}
+        error = error if isinstance(error, dict) else {}
+        code = str(error.get("code") or error.get("type") or "").strip()
+        param = str(error.get("param") or "").strip()
+        detail = "/".join(item for item in (code, param) if item)
+        suffix = f" ({detail})" if detail else ""
+        raise RuntimeError(f"OAICS PayPal Intent confirm 失败 HTTP {status_code}{suffix}")
+    return _response_json(response, "确认 OAICS PayPal Intent")
+
+
+def oaics_standard_paypal_redirect(
+    http,
+    state: dict[str, Any],
+    *,
+    access_token: str,
+    session_id: str,
+    processor_entity: str,
+    billing: dict[str, Any],
+    country: str,
+    currency: str,
+    device_id: str,
+    sentinel_proxy: str,
+    log: Callable[[str], None] = lambda _message: None,
+) -> tuple[str, dict[str, Any]]:
+    elements = create_oaics_elements_session(
+        http,
+        state,
+        country=country,
+        currency=currency,
+        log=log,
+    )
+    confirmation_token = create_oaics_paypal_confirmation_token(
+        http,
+        state,
+        elements,
+        billing=billing,
+        currency=currency,
+        log=log,
+    )
+    try:
+        app_confirm = confirm_oaics_standard_paypal(
+            http,
+            access_token,
+            session_id,
+            processor_entity,
+            confirmation_token,
+            country=country,
+            device_id=device_id,
+            sentinel_proxy=sentinel_proxy,
+            log=log,
+        )
+    except OaicsConfirmBlockedError:
+        log("[oaics] 标准 PayPal confirm 首次 blocked，刷新 SEN/SO 后重试")
+        app_confirm = confirm_oaics_standard_paypal(
+            http,
+            access_token,
+            session_id,
+            processor_entity,
+            confirmation_token,
+            country=country,
+            device_id=device_id,
+            sentinel_proxy=sentinel_proxy,
+            log=log,
+        )
+    redirect_url = extract_redirect_url(app_confirm)
+    intent_confirm: dict[str, Any] = {}
+    if not redirect_url:
+        intent_confirm = confirm_oaics_paypal_intent(
+            http,
+            confirmation_token,
+            app_confirm,
+            elements,
+            log=log,
+        )
+        redirect_url = extract_redirect_url(intent_confirm)
+    if not redirect_url:
+        raise RuntimeError("OAICS PayPal Intent confirm 未返回 PayPal 跳转地址")
+    return redirect_url, {
+        "checkout_state": state,
+        "elements": elements,
+        "app_confirm": app_confirm,
+        "intent_confirm": intent_confirm,
+        "selected_payment_method_type": "paypal",
+    }
+
+
+def confirm_oaics_custom_payment_method(
+    http,
+    access_token: str,
+    session_id: str,
+    processor_entity: str,
+    custom_payment_method_id: str,
+    *,
+    country: str,
+    device_id: str,
+    sentinel_proxy: str,
+    log: Callable[[str], None] = lambda _message: None,
+) -> dict[str, Any]:
+    checkout_url = f"https://chatgpt.com/checkout/{processor_entity}/{session_id}"
+    headers = {
+        **_oaics_headers(
+            access_token,
+            country=country,
+            device_id=device_id,
+            referer=checkout_url,
+            route="/backend-api/payments/checkout/confirm",
+        ),
+        "Content-Type": "application/json",
+    }
+    sentinel, sentinel_so = _mint_sentinel(
+        "checkout_session_approval",
+        SentinelCtx(
+            device_id=device_id,
+            user_agent=CHROME_UA,
+            proxy=sentinel_proxy,
+            country=country,
+            page_url=checkout_url,
+            cookie_header=_session_cookie_header(http),
+        ),
+        log,
+    )
+    if sentinel:
+        headers["OpenAI-Sentinel-Token"] = sentinel
+    if sentinel_so:
+        headers["OpenAI-Sentinel-SO-Token"] = sentinel_so
+    route = "/backend-api/payments/checkout/confirm"
+    body = {
+        "checkout_session_id": session_id,
+        "processor_entity": processor_entity,
+        "selected_payment_method_type": custom_payment_method_id,
+    }
+    try:
+        response = http.post(
+            OPENAI_CHECKOUT_CONFIRM_URL,
+            json=body,
+            headers=headers,
+            timeout=50,
+        )
+    except Exception as exc:
+        _protocol_diagnostic(
+            log,
+            kind="checkout_confirm",
+            method="POST",
+            route=route,
+            request_payload=body,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    text = str(getattr(response, "text", "") or "")
+    response_payload = _diagnostic_response_payload(response)
+    _protocol_diagnostic(
+        log,
+        kind="checkout_confirm",
+        method="POST",
+        route=route,
+        status=status_code,
+        request_payload=body,
+        response_payload=response_payload,
+        response=response,
+    )
+    try:
+        payload = _response_json(response, "确认 OAICS PayPal 支付方式")
+    except RuntimeError:
+        if status_code != 200:
+            raise RuntimeError(
+                f"确认 OAICS PayPal 支付方式失败 HTTP {status_code}: {text[:300]}"
+            )
+        raise
+    status = str(payload.get("status") or "").strip().lower()
+    if status_code == 401:
+        raise ChatGPTAuthError("确认 OAICS PayPal 支付方式失败 HTTP 401")
+    if status == "blocked" or "blocked" in text.lower():
+        raise OaicsConfirmBlockedError("OAICS PayPal confirm blocked")
+    if status_code != 200:
+        raise RuntimeError(
+            f"确认 OAICS PayPal 支付方式失败 HTTP {status_code}: {text[:300]}"
+        )
+    if status != "success":
+        raise RuntimeError(
+            f"确认 OAICS PayPal 支付方式失败 status={status or 'unknown'}: {text[:300]}"
+        )
+    return payload
+
+
+def start_oaics_custom_payment_method(
+    http,
+    access_token: str,
+    session_id: str,
+    processor_entity: str,
+    custom_payment_method_id: str,
+    *,
+    country: str,
+    device_id: str,
+    log: Callable[[str], None] = lambda _message: None,
+) -> dict[str, Any]:
+    checkout_url = f"https://chatgpt.com/checkout/{processor_entity}/{session_id}"
+    route = "/backend-api/payments/checkout/custom_payment_method/start"
+    body = {
+        "checkout_session_id": session_id,
+        "processor_entity": processor_entity,
+        "custom_payment_method_type_id": custom_payment_method_id,
+    }
+    try:
+        response = http.post(
+            OPENAI_CUSTOM_PAYMENT_START_URL,
+            json=body,
+            headers={
+                **_oaics_headers(
+                    access_token,
+                    country=country,
+                    device_id=device_id,
+                    referer=checkout_url,
+                    route=route,
+                ),
+                "Content-Type": "application/json",
+            },
+            timeout=60,
+        )
+    except Exception as exc:
+        _protocol_diagnostic(
+            log,
+            kind="custom_payment_start",
+            method="POST",
+            route=route,
+            request_payload=body,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    text = str(getattr(response, "text", "") or "")
+    _protocol_diagnostic(
+        log,
+        kind="custom_payment_start",
+        method="POST",
+        route=route,
+        status=status_code,
+        request_payload=body,
+        response_payload=_diagnostic_response_payload(response),
+        response=response,
+    )
+    if status_code == 401:
+        raise ChatGPTAuthError("启动 OAICS PayPal 支付失败 HTTP 401")
+    if status_code != 200:
+        raise RuntimeError(f"启动 OAICS PayPal 支付失败 HTTP {status_code}: {text[:300]}")
+    payload = _response_json(response, "启动 OAICS PayPal 支付")
+    action = payload.get("next_action")
+    action = action if isinstance(action, dict) else {}
+    action_url = str(action.get("url") or "").strip()
+    if str(payload.get("status") or "").lower() != "requires_action" or not action_url:
+        raise RuntimeError(f"OAICS PayPal start 未返回跳转地址: {text[:300]}")
+    return payload
+
+
+def oaics_to_paypal_redirect(
+    http,
+    session_id: str,
+    *,
+    access_token: str,
+    processor_entity: str,
+    billing: dict[str, Any],
+    country: str,
+    currency: str,
+    device_id: str,
+    sentinel_proxy: str,
+    log: Callable[[str], None] = lambda _message: None,
+) -> tuple[str, dict[str, Any]]:
+    state: dict[str, Any] = {}
+    methods: list[dict[str, Any]] = []
+    for attempt in range(1, 4):
+        state = fetch_oaics_checkout_session(
+            http,
+            access_token,
+            session_id,
+            processor_entity,
+            country=country,
+            device_id=device_id,
+            log=log,
+        )
+        verify_oaics_zero_snapshot(
+            state,
+            session_id=session_id,
+            currency=currency,
+        )
+        payment_method_types = oaics_payment_method_types(state)
+        if "paypal" in payment_method_types:
+            log("[oaics] Checkout 已开放标准 PayPal，进入 ConfirmationToken 流程")
+            return oaics_standard_paypal_redirect(
+                http,
+                state,
+                access_token=access_token,
+                session_id=session_id,
+                processor_entity=processor_entity,
+                billing=billing,
+                country=country,
+                currency=currency,
+                device_id=device_id,
+                sentinel_proxy=sentinel_proxy,
+                log=log,
+            )
+        methods = oaics_custom_payment_methods(state)
+        if methods:
+            break
+        if payment_method_types:
+            raise PayPalFundingUnavailableError(
+                session_id,
+                payment_method_types,
+                "OAICS payment_method_types 未包含 paypal",
+            )
+        if attempt < 3:
+            log(f"[oaics] 等待 Checkout 支付方式同步 {attempt + 1}/3")
+            time.sleep(0.8 * attempt)
+    if not methods:
+        raise RuntimeError(
+            "OAICS Checkout 未返回可判定的 payment_method_types 或 cpmt_ 支付方式"
+        )
+
+    last_blocked: OaicsConfirmBlockedError | None = None
+    for method in methods:
+        method_id = str(method.get("id") or "")
+        try:
+            confirmed = confirm_oaics_custom_payment_method(
+                http,
+                access_token,
+                session_id,
+                processor_entity,
+                method_id,
+                country=country,
+                device_id=device_id,
+                sentinel_proxy=sentinel_proxy,
+                log=log,
+            )
+        except OaicsConfirmBlockedError as exc:
+            last_blocked = exc
+            log("[oaics] PayPal confirm 首次 blocked，刷新 SEN/SO 后重试")
+            confirmed = confirm_oaics_custom_payment_method(
+                http,
+                access_token,
+                session_id,
+                processor_entity,
+                method_id,
+                country=country,
+                device_id=device_id,
+                sentinel_proxy=sentinel_proxy,
+                log=log,
+            )
+        started = start_oaics_custom_payment_method(
+            http,
+            access_token,
+            session_id,
+            processor_entity,
+            method_id,
+            country=country,
+            device_id=device_id,
+            log=log,
+        )
+        action = started.get("next_action")
+        action = action if isinstance(action, dict) else {}
+        redirect_url = str(action.get("url") or "").strip()
+        payment_type = str(
+            action.get("paymentMethodType")
+            or action.get("payment_method_type")
+            or ""
+        ).lower()
+        if "paypal" in payment_type or "paypal" in redirect_url.lower():
+            return redirect_url, {
+                "checkout_state": state,
+                "confirmed": confirmed,
+                "started": started,
+                "custom_payment_method_id": method_id,
+            }
+        log(f"[oaics] 自定义支付 {method_id[:14]} 不是 PayPal，继续检查")
+    if last_blocked is not None:
+        raise last_blocked
+    raise PayPalFundingUnavailableError(
+        session_id,
+        [str(item.get("id") or "") for item in methods],
+        "OAICS 自定义支付方式均未返回 PayPal 跳转",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1028,16 +2286,16 @@ def verify_zero_amount_snapshot(init_data: Any, ctx: Optional[dict] = None) -> t
     return True, ", ".join(f"{label}=0" for label, _ in values), 0
 
 
-def verify_promo_checkout_zero(
+def verify_checkout_zero(
     http,
     session_id: str,
     *,
     country: str,
     publishable_key: str = "",
     log: Callable[[str], None],
-    attempts: int = PROMO_AMOUNT_VERIFY_ATTEMPTS,
+    attempts: int = ZERO_AMOUNT_VERIFY_ATTEMPTS,
 ) -> None:
-    """Verify the promo checkout through its own proxy without checking PayPal."""
+    """Require a verifiable zero amount before any PayPal operation."""
     pk = str(publishable_key or "").strip() or verify_pk(http, session_id, log)
     last_amount: Any = "unknown"
     last_detail = ""
@@ -1045,15 +2303,15 @@ def verify_promo_checkout_zero(
         init_data, _version, ctx = init_checkout(http, session_id, pk, _profile(country), log)
         ok, detail, amount = verify_zero_amount_snapshot(init_data, ctx)
         if ok:
-            log(f"[promo] 0 元订单已确认（session={session_id}）；此阶段不检查 PayPal")
+            log(f"[checkout] 0 元订单已确认（session={session_id}）")
             return
         last_amount, last_detail = amount, detail
         if attempt < max(1, attempts):
             log(
-                f"[promo] 优惠金额尚未变为 0，保留同一订单重查 "
+                f"[checkout] 应付金额尚未变为 0，保留同一订单重查 "
                 f"{attempt + 1}/{max(1, attempts)}（{detail}）"
             )
-            time.sleep(PROMO_AMOUNT_VERIFY_DELAY_SECONDS)
+            time.sleep(ZERO_AMOUNT_VERIFY_DELAY_SECONDS)
     raise PromoNotAppliedError(session_id, last_amount, "", last_detail)
 
 

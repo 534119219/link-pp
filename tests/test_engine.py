@@ -16,7 +16,10 @@ from handoff.engine import (
 )
 from handoff.gateway import CheckoutArtifact, ProviderResult
 from handoff.proxies import ProxyPool, parse_proxy_lines
-from handoff.protocol.stripe_checkout import CheckoutPreflightError
+from handoff.protocol.stripe_checkout import (
+    CheckoutPreflightError,
+    PayPalFundingUnavailableError,
+)
 from handoff.security import TokenProfile
 
 
@@ -37,11 +40,14 @@ class FakeGateway:
                 return custom
         number = len(self.checkout_calls)
         return CheckoutArtifact(
-            session_id=f"cs_live_{number}",
-            processor_entity="openai_llc",
-            checkout_country=kwargs["country"].code,
-            currency=kwargs["country"].currency,
-            checkout_url=f"https://chatgpt.com/checkout/openai_llc/cs_live_{number}",
+            session_id=f"oaics_{number}",
+            processor_entity=kwargs["checkout_country"].processor_entity,
+            country=kwargs["checkout_country"].code,
+            currency=kwargs["checkout_country"].currency,
+            checkout_url=(
+                "https://chatgpt.com/checkout/"
+                f"{kwargs['checkout_country'].processor_entity}/oaics_{number}"
+            ),
         )
 
     def attempt_provider(self, **kwargs):
@@ -55,10 +61,9 @@ def make_spec(*, checkout_attempts=5, provider_attempts=10):
     return RunSpec(
         access_token="secret-at",
         token_profile=TokenProfile("owner@example.com", "Owner", "acct"),
-        checkout_country=get_country("BR"),
-        promo_country=get_country("DE"),
-        checkout_proxies=ProxyPool(parse_proxy_lines("checkout-a:1001\ncheckout-b:1002")),
-        promo_proxies=ProxyPool(parse_proxy_lines("promo-a:2001\npromo-b:2002")),
+        proxy_country=get_country("BR"),
+        checkout_country=get_country("DE"),
+        proxies=ProxyPool(parse_proxy_lines("checkout-a:1001\ncheckout-b:1002")),
         checkout_attempts=checkout_attempts,
         provider_attempts=provider_attempts,
     )
@@ -66,7 +71,7 @@ def make_spec(*, checkout_attempts=5, provider_attempts=10):
 
 def success_result():
     return ProviderResult(
-        stripe_redirect_url="https://pm-redirects.stripe.com/authorize/test",
+        provider_redirect_url="https://www.paypal.com/agreements/approve?ba_token=BA-TEST",
         paypal_approve_url="https://www.paypal.com/agreements/approve?ba_token=BA-TEST",
         ba_token="BA-TEST",
     )
@@ -102,8 +107,30 @@ def test_provider_success_returns_links_without_payment_state():
     assert len(gateway.checkout_calls) == 1
     assert len(gateway.provider_calls) == 3
     assert result.paypal_approve_url.endswith("BA-TEST")
-    assert result.stripe_redirect_url.endswith("/test")
+    assert result.provider_redirect_url.endswith("BA-TEST")
+    assert result.proxy_country == "BR"
+    assert result.country == "DE"
+    assert result.currency == "EUR"
+    checkout_call = gateway.checkout_calls[0]
+    assert checkout_call["proxy_country"].code == "BR"
+    assert checkout_call["checkout_country"].code == "DE"
+    assert checkout_call["billing"]["address"]["country"] == "DE"
+    provider_call = gateway.provider_calls[0]
+    assert provider_call["proxy_country"].code == "BR"
+    assert provider_call["checkout_country"].code == "DE"
+    assert provider_call["billing"]["address"]["country"] == "DE"
     assert "payment_completed" not in result.to_dict()
+
+
+def test_route_log_distinguishes_brazil_exit_from_german_billing():
+    logs = []
+    gateway = FakeGateway(provider_behavior=lambda _number, _kwargs: success_result())
+    HandoffEngine(gateway).run(
+        make_spec(checkout_attempts=1, provider_attempts=1),
+        emit=lambda *item: logs.append(item),
+        is_cancelled=lambda: False,
+    )
+    assert any("BR 出口 · DE/EUR 账单" in message for _level, _stage, message in logs)
 
 
 def test_preflight_failure_does_not_consume_checkout_and_first_provider_reuses_proxy():
@@ -155,13 +182,56 @@ def test_access_token_is_redacted_from_logs_and_errors():
     assert token not in repr(logs) + str(captured.value)
 
 
+def test_final_error_keeps_confirmed_paypal_unavailable_over_later_tls_noise():
+    def checkout_behavior(number, _kwargs):
+        if number == 2:
+            raise RuntimeError(
+                "request_error: curl: (56) OPENSSL_internal:BAD_DECRYPT"
+            )
+        return None
+
+    gateway = FakeGateway(
+        checkout_behavior=checkout_behavior,
+        provider_behavior=lambda _number, _kwargs: (_ for _ in ()).throw(
+            PayPalFundingUnavailableError(
+                "oaics_test",
+                ["cpmt_card"],
+                "OAICS 明确未提供 PayPal",
+            )
+        ),
+    )
+
+    with pytest.raises(FlowExhaustedError, match="未开放 PayPal"):
+        HandoffEngine(gateway).run(
+            make_spec(checkout_attempts=2, provider_attempts=3),
+            emit=lambda *_item: None,
+            is_cancelled=lambda: False,
+        )
+
+    assert len(gateway.provider_calls) == 1
+
+
 def test_attempt_validation_and_short_reasons():
     assert positive_attempts("3", default=1) == 3
     with pytest.raises(ValueError):
         positive_attempts(0, default=1)
     assert _short_reason(TimeoutError("read timed out"), "") == "代理连接失败"
+    assert (
+        _short_reason(
+            RuntimeError("curl: (56) OPENSSL_internal:BAD_DECRYPT"),
+            "",
+        )
+        == "代理 TLS 解密异常（BAD_DECRYPT）"
+    )
     assert _short_reason(RuntimeError("manual_approval approve blocked"), "") == "审批被拒绝"
     assert _short_reason(RuntimeError("decline_code=generic_decline"), "") == "风控拒绝（generic_decline）"
+    assert (
+        _short_reason(
+            RuntimeError("免费促销未实际生效 (session=oaics_test, Checkout due=2300 EUR)"),
+            "",
+        )
+        == "已生成 OAICS，但前置优惠未生效（应付金额非 0）"
+    )
     assert (
         _short_reason(
             RuntimeError("无法确认 Stripe publishable_key（404 resource_missing）"),
