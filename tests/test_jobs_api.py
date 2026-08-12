@@ -210,7 +210,7 @@ def test_job_exposes_distinct_oaics_nonzero_failure_reason():
     app.extensions["job_manager"].shutdown()
 
 
-def test_batch_results_use_paypal_approve_url_and_mask_accounts():
+def test_batch_results_use_paypal_approve_url_and_full_accounts():
     first = make_token(email="first.owner@example.com")
     second = make_token(email="second.owner@example.com")
     app = create_app({"TESTING": True, "JOB_WORKERS": 2}, gateway=SuccessGateway())
@@ -223,9 +223,11 @@ def test_batch_results_use_paypal_approve_url_and_mask_accounts():
     assert created.get_json()["duplicate_count"] == 1
     snapshot = wait_for_batch(client, created.get_json()["id"])
     assert snapshot["counts"]["success"] == 2
-    assert snapshot["jobs"][0]["label"].startswith("#001 · fi***@")
+    assert snapshot["jobs"][0]["label"] == "#001 · first.owner@example.com"
     csv_text = client.get(f"/api/batches/{snapshot['id']}/results.csv").get_data(as_text=True)
     assert "BA-SUCCESS" in csv_text
+    assert "first.owner@example.com" in csv_text
+    assert "second.owner@example.com" in csv_text
     assert "支付类型" not in csv_text
     assert first not in csv_text and second not in csv_text
     app.extensions["job_manager"].shutdown()

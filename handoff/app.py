@@ -33,14 +33,6 @@ def _proxy_text(value: object) -> str:
     return str(value or "")
 
 
-def _masked_email(value: str) -> str:
-    local, separator, domain = str(value or "").partition("@")
-    if not separator:
-        return "账号"
-    visible = local[:2] if len(local) > 1 else local[:1]
-    return f"{visible}***@{domain}"
-
-
 def _parse_shared_run_config(payload: dict) -> dict:
     proxy_country = get_country(
         payload.get("country") or payload.get("proxy_country", "")
@@ -230,7 +222,7 @@ def create_app(config: dict | None = None, *, gateway=None) -> Flask:
                         spec.clear_secrets()
                         raise ValueError(f"单个批次最多 {max_batch_items} 个唯一 AT")
                     seen_tokens.add(spec.access_token)
-                    label = f"#{len(items) + 1:03d} · {_masked_email(spec.token_profile.email)}"
+                    label = f"#{len(items) + 1:03d} · {spec.token_profile.email}"
                     items.append((label, spec))
             except Exception:
                 for _label, item_spec in items:

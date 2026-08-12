@@ -75,14 +75,6 @@
     } catch { return null; }
   }
 
-  function maskEmail(email) {
-    if (!email) return "";
-    const [local, domain] = email.split("@");
-    if (!domain) return email;
-    const visible = local.length > 2 ? local.slice(0, 2) : local.slice(0, 1);
-    return `${visible}***@${domain}`;
-  }
-
   // ─── Proxy Parser ─────────────────────────────────────────────────
   const SUPPORTED_SCHEMES = new Set(["socks5", "socks5h", "http", "https"]);
   const SCHEME_ALIASES = { socket5: "socks5", socks: "socks5" };
@@ -322,7 +314,7 @@
   function updateATProfile() {
     const p = parseATProfile(atInput.value);
     if (p) {
-      $("atEmail").textContent = maskEmail(p.email);
+      $("atEmail").textContent = p.email;
       $("atName").textContent = p.name;
       atProfile.hidden = false;
     } else {
@@ -345,7 +337,7 @@
       count++;
       const p = parseATProfile(line);
       if (p) {
-        html += `<div class="at-batch-item"><span class="at-line-num">${count}</span><span class="at-line-email">${esc(maskEmail(p.email))}</span></div>`;
+        html += `<div class="at-batch-item"><span class="at-line-num">${count}</span><span class="at-line-email">${esc(p.email)}</span></div>`;
       } else {
         html += `<div class="at-batch-item invalid"><span class="at-line-num">${count}</span><span>格式无效</span></div>`;
       }
@@ -411,14 +403,14 @@
     src.addEventListener("result", e => {
       const r = JSON.parse(e.data).data;
       renderResult(r);
-      addHistory({ type: "single", status: "success", email: maskEmail(parseATProfile(atInput.value)?.email || ""), result: r, time: nowISO() });
+      addHistory({ type: "single", status: "success", email: parseATProfile(atInput.value)?.email || "", result: r, time: nowISO() });
     });
     src.addEventListener("done", e => {
       closeES(); state.jobId = "";
       $("singleStopBtn").disabled = true; $("singleStartBtn").disabled = false;
       const d = JSON.parse(e.data).data;
       if (d.status === "failed" || d.status === "cancelled") {
-        addHistory({ type: "single", status: d.status, email: maskEmail(parseATProfile(atInput.value)?.email || ""), error: "任务" + (d.status === "failed" ? "失败" : "停止"), time: nowISO() });
+        addHistory({ type: "single", status: d.status, email: parseATProfile(atInput.value)?.email || "", error: "任务" + (d.status === "failed" ? "失败" : "停止"), time: nowISO() });
       }
     });
     src.onerror = () => { if (state.jobId) mainLog.push({ time: nowTime(), level: "warn", stage: "stream", message: "连接中断，尝试重连..." }); };
