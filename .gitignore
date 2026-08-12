@@ -1,0 +1,15 @@
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.venv/
+.env
+.env.*
+!.env.example
+.claude/
+.playwright-mcp/
+node_modules/
+_confirm_dump.json
+data/
+diagnostics/
+*.log
+.DS_Store

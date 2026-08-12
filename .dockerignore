@@ -1,0 +1,16 @@
+.git
+.gitignore
+.claude
+.playwright-mcp
+.pytest_cache
+.venv
+.env
+.env.*
+**/__pycache__
+**/*.pyc
+diagnostics
+data
+node_modules
+tests
+*.log
+.DS_Store

@@ -1,0 +1,30 @@
+services:
+  app:
+    build:
+      context: .
+    image: paypal-dual-country-extractor:latest
+    container_name: paypal-dual-country-extractor
+    restart: unless-stopped
+    init: true
+    environment:
+      HANDOFF_DIAGNOSTIC_DIR: /data/diagnostics
+    ports:
+      - "5572:5572"
+    volumes:
+      - paypal-dual-country-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    stop_grace_period: 35s
+
+volumes:
+  paypal-dual-country-data:
