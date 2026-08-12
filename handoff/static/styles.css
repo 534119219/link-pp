@@ -335,7 +335,7 @@ select.input { padding-right: 32px; }
 .batch-jobs-card > .card-header { padding: 14px 20px; margin: 0; border-bottom: 1px solid var(--border-light); }
 .batch-job-list { max-height: 420px; overflow-y: auto; }
 .batch-job-item {
-  display: grid; grid-template-columns: minmax(0,1fr) 70px 60px auto;
+  display: grid; grid-template-columns: minmax(180px,0.8fr) 70px 60px minmax(260px,1.4fr);
   align-items: center; gap: 10px; padding: 10px 20px;
   border-bottom: 1px solid var(--border-light); cursor: pointer;
   transition: background var(--transition);
@@ -349,8 +349,9 @@ select.input { padding-right: 32px; }
 .job-status[data-s="failed"],.job-status[data-s="cancelled"] { color: var(--danger); }
 .job-status[data-s="running"],.job-status[data-s="queued"] { color: var(--warn); }
 .job-attempt { font-size: 11px; color: var(--text-muted); text-align: center; }
-.job-result { font-size: 11px; }
+.job-result { min-width: 0; font-size: 11px; }
 .job-result a { font-family: var(--mono); }
+.job-reason { display: block; color: var(--text-muted); line-height: 1.4; overflow-wrap: anywhere; }
 
 .batch-log-card { padding: 0; }
 .batch-log-card > .card-header { padding: 12px 20px; margin: 0; border-bottom: 1px solid var(--border-light); }

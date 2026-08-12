@@ -115,13 +115,28 @@ def get_country(code: str) -> CountryProfile:
         raise ValueError(f"不支持的国家代码: {normalized or '(空)'}") from exc
 
 
+def checkout_country_for_proxy(proxy_country: CountryProfile) -> CountryProfile:
+    if proxy_country.code == "BR":
+        return get_country("DE")
+    return proxy_country
+
+
 def list_countries() -> list[dict[str, str]]:
     preferred = {"US": 0, "BR": 1, "GB": 2, "DE": 3, "FR": 4, "JP": 5, "TH": 6}
     items = sorted(
         COUNTRIES.values(),
         key=lambda item: (preferred.get(item.code, 100), item.name),
     )
-    return [item.public_dict() for item in items]
+    result = []
+    for item in items:
+        checkout_country = checkout_country_for_proxy(item)
+        public = item.public_dict()
+        public.update(
+            checkout_country=checkout_country.code,
+            checkout_currency=checkout_country.currency,
+        )
+        result.append(public)
+    return result
 
 
 def install_protocol_profiles(protocol_module: object) -> None:

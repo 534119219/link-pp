@@ -13,16 +13,16 @@ from handoff.jobs import Job
 class SuccessGateway:
     def create_checkout(self, **kwargs):
         return CheckoutArtifact(
-            session_id="cs_live_success",
-            processor_entity="openai_llc",
-            checkout_country=kwargs["country"].code,
-            currency=kwargs["country"].currency,
-            checkout_url="https://chatgpt.com/checkout/openai_llc/cs_live_success",
+            session_id="oaics_success",
+            processor_entity=kwargs["checkout_country"].processor_entity,
+            country=kwargs["checkout_country"].code,
+            currency=kwargs["checkout_country"].currency,
+            checkout_url="https://chatgpt.com/checkout/openai_ie/oaics_success",
         )
 
     def attempt_provider(self, **_kwargs):
         return ProviderResult(
-            stripe_redirect_url="https://pm-redirects.stripe.com/authorize/success",
+            provider_redirect_url="https://www.paypal.com/agreements/approve?ba_token=BA-SUCCESS",
             paypal_approve_url="https://www.paypal.com/agreements/approve?ba_token=BA-SUCCESS",
             ba_token="BA-SUCCESS",
         )
@@ -41,6 +41,40 @@ class DiagnosticGateway(SuccessGateway):
         return super().attempt_provider(**kwargs)
 
 
+class ProtocolDiagnosticGateway(SuccessGateway):
+    def attempt_provider(self, **kwargs):
+        kwargs["log"](
+            "[protocol-diagnostic] "
+            + json.dumps(
+                {
+                    "kind": "checkout_taxes",
+                    "method": "POST",
+                    "route": "/backend-api/payments/checkout/taxes",
+                    "http_status": 200,
+                    "request": {
+                        "checkout_session_id": "oaics_success",
+                        "checkout_email": "owner@example.com",
+                        "billing_name": "Owner",
+                        "billing_address": {
+                            "line1": "private address",
+                            "country": "DE",
+                        },
+                    },
+                    "response": {
+                        "checkout_session": {
+                            "currency": "EUR",
+                            "total_summary": {"due": 0},
+                            "client_secret": "private-secret",
+                        }
+                    },
+                    "response_headers": {"x-request-id": "req_fixture"},
+                },
+                separators=(",", ":"),
+            )
+        )
+        return super().attempt_provider(**kwargs)
+
+
 class RetryGateway(SuccessGateway):
     def __init__(self):
         self._lock = threading.Lock()
@@ -54,6 +88,14 @@ class RetryGateway(SuccessGateway):
         if count == 1:
             raise RuntimeError("temporary failure")
         return super().create_checkout(**kwargs)
+
+
+class NonzeroOaicsGateway(SuccessGateway):
+    def create_checkout(self, **_kwargs):
+        raise RuntimeError(
+            "免费促销未实际生效 "
+            "(session=oaics_nonzero, Checkout due=2300 EUR)"
+        )
 
 
 class SlowGateway(SuccessGateway):
@@ -77,12 +119,9 @@ class SlowGateway(SuccessGateway):
 def payload(token):
     return {
         "access_token": token,
-        "checkout_country": "BR",
-        "promo_country": "DE",
-        "checkout_proxy_scheme": "socks5",
-        "promo_proxy_scheme": "socks5",
-        "checkout_proxies": "checkout.example:1000:user:pass",
-        "promo_proxies": "promo.example:2000:user:pass",
+        "country": "BR",
+        "proxy_scheme": "socks5",
+        "proxies": "checkout.example:1000:user:pass",
         "checkout_attempts": 2,
         "provider_attempts": 2,
     }
@@ -112,11 +151,16 @@ def test_meta_and_frontend_only_expose_link_extraction():
     meta = client.get("/api/meta").get_json()
     assert meta["defaults"]["checkout_attempts"] == 5
     assert meta["defaults"]["provider_attempts"] == 10
+    assert meta["defaults"]["country"] == "BR"
+    assert meta["defaults"]["checkout_country"] == "DE"
+    brazil = next(item for item in meta["countries"] if item["code"] == "BR")
+    assert brazil["checkout_country"] == "DE"
+    assert brazil["checkout_currency"] == "EUR"
     assert "link_types" not in meta
     html = client.get("/").get_data(as_text=True)
-    assert "双国家 PayPal 提链" in html
+    assert "PayPal 提链" in html
     assert 'id="ckSearch"' in html
-    assert 'id="pmSearch"' in html
+    assert 'id="pmSearch"' not in html
     for forbidden in ("OTP", "Captcha", "手机号", "PIX", "协议支付", "PayPal User"):
         assert forbidden not in html
     app.extensions["job_manager"].shutdown()
@@ -132,7 +176,13 @@ def test_job_returns_links_without_payment_fields_or_secrets():
     serialized = json.dumps(snapshot)
     assert snapshot["status"] == "success"
     assert snapshot["result"]["paypal_approve_url"].endswith("BA-SUCCESS")
-    assert snapshot["result"]["stripe_redirect_url"].endswith("/success")
+    assert snapshot["result"]["provider_redirect_url"].endswith("BA-SUCCESS")
+    assert snapshot["config"]["proxy_country"] == "BR"
+    assert snapshot["config"]["checkout_country"] == "DE"
+    assert snapshot["config"]["checkout_currency"] == "EUR"
+    assert snapshot["result"]["proxy_country"] == "BR"
+    assert snapshot["result"]["country"] == "DE"
+    assert snapshot["result"]["currency"] == "EUR"
     for removed in ("payment_completed", "stripe_state", "paypal_user_id", "paypal_callback_url"):
         assert removed not in snapshot["result"]
     assert token not in serialized
@@ -141,7 +191,26 @@ def test_job_returns_links_without_payment_fields_or_secrets():
     app.extensions["job_manager"].shutdown()
 
 
-def test_batch_results_use_paypal_approve_url_and_mask_accounts():
+def test_job_exposes_distinct_oaics_nonzero_failure_reason():
+    token = make_token()
+    app = create_app({"TESTING": True}, gateway=NonzeroOaicsGateway())
+    client = app.test_client()
+    request = payload(token)
+    request["checkout_attempts"] = 1
+    snapshot = wait_for_job(
+        client,
+        client.post("/api/jobs", json=request).get_json()["job_id"],
+    )
+
+    assert snapshot["status"] == "failed"
+    assert snapshot["failure_reason"] == (
+        "已生成 OAICS，但前置优惠未生效（应付金额非 0）"
+    )
+    assert "普通 Stripe Checkout" not in snapshot["failure_reason"]
+    app.extensions["job_manager"].shutdown()
+
+
+def test_batch_results_use_paypal_approve_url_and_full_accounts():
     first = make_token(email="first.owner@example.com")
     second = make_token(email="second.owner@example.com")
     app = create_app({"TESTING": True, "JOB_WORKERS": 2}, gateway=SuccessGateway())
@@ -154,9 +223,11 @@ def test_batch_results_use_paypal_approve_url_and_mask_accounts():
     assert created.get_json()["duplicate_count"] == 1
     snapshot = wait_for_batch(client, created.get_json()["id"])
     assert snapshot["counts"]["success"] == 2
-    assert snapshot["jobs"][0]["label"].startswith("#001 · fi***@")
+    assert snapshot["jobs"][0]["label"] == "#001 · first.owner@example.com"
     csv_text = client.get(f"/api/batches/{snapshot['id']}/results.csv").get_data(as_text=True)
     assert "BA-SUCCESS" in csv_text
+    assert "first.owner@example.com" in csv_text
+    assert "second.owner@example.com" in csv_text
     assert "支付类型" not in csv_text
     assert first not in csv_text and second not in csv_text
     app.extensions["job_manager"].shutdown()
@@ -255,15 +326,48 @@ def test_confirm_diagnostic_write_failure_does_not_fail_extraction(monkeypatch, 
     manager.shutdown()
 
 
+def test_protocol_diagnostic_is_backend_only_structured_and_sanitized(tmp_path):
+    token = make_token()
+    app = create_app(
+        {"TESTING": True, "DIAGNOSTIC_DIR": str(tmp_path)},
+        gateway=ProtocolDiagnosticGateway(),
+    )
+    client = app.test_client()
+    job_id = client.post("/api/jobs", json=payload(token)).get_json()["job_id"]
+    snapshot = wait_for_job(client, job_id)
+    assert snapshot["status"] == "success"
+
+    stream = client.get(f"/api/jobs/{job_id}/events?after=0").get_data(as_text=True)
+    assert "protocol-diagnostic" not in stream
+    assert "private address" not in stream
+    records = [
+        json.loads(line)
+        for line in (tmp_path / f"{job_id}.jsonl").read_text().splitlines()
+    ]
+    record = next(item for item in records if item["kind"] == "checkout_taxes")
+    response = record["response"]
+    serialized = json.dumps(record)
+    assert response["http_status"] == 200
+    assert response["response_headers"]["x-request-id"] == "req_fixture"
+    assert response["request"]["checkout_email"] == "[REDACTED]"
+    assert response["request"]["billing_name"] == "[REDACTED]"
+    assert set(response["request"]["billing_address"].values()) == {"[REDACTED]"}
+    assert response["response"]["checkout_session"]["total_summary"]["due"] == 0
+    assert "owner@example.com" not in serialized
+    assert "private-secret" not in serialized
+    assert token not in serialized
+    app.extensions["job_manager"].shutdown()
+
+
 def test_api_rejects_bad_country_proxy_and_removed_payment_fields_are_ignored():
     token = make_token()
     app = create_app({"TESTING": True}, gateway=SuccessGateway())
     client = app.test_client()
     bad_country = payload(token)
-    bad_country["checkout_country"] = "XX"
+    bad_country["country"] = "XX"
     assert client.post("/api/jobs", json=bad_country).status_code == 400
     bad_proxy = payload(token)
-    bad_proxy["promo_proxies"] = "host:badport:user:very-secret"
+    bad_proxy["proxies"] = "host:badport:user:very-secret"
     response = client.post("/api/jobs", json=bad_proxy)
     assert response.status_code == 400
     assert "very-secret" not in response.get_data(as_text=True)

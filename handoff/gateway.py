@@ -46,7 +46,7 @@ class CheckoutTransport:
 class CheckoutArtifact:
     session_id: str
     processor_entity: str
-    checkout_country: str
+    country: str
     currency: str
     checkout_url: str
     amount: int | None = None
@@ -60,7 +60,7 @@ class CheckoutArtifact:
 
 @dataclass(frozen=True, slots=True)
 class ProviderResult:
-    stripe_redirect_url: str
+    provider_redirect_url: str
     paypal_approve_url: str
     ba_token: str
 
@@ -71,22 +71,18 @@ def new_device_id() -> str:
 
 def preflight_checkout_route(
     *,
-    checkout_http,
-    checkout_country: str,
-    promo_http,
-    promo_country: str,
+    http,
+    proxy_country: str,
     access_token: str,
     device_id: str,
     log: LogFn,
 ) -> None:
-    checkout_info = stripe.verify_proxy_exit_country(checkout_http, checkout_country)
-    log(f"主链路出口预检通过：{stripe.proxy_exit_log_label(checkout_info)}")
-    promo_info = stripe.verify_proxy_exit_country(promo_http, promo_country)
-    log(f"优惠出口预检通过：{stripe.proxy_exit_log_label(promo_info)}")
+    checkout_info = stripe.verify_proxy_exit_country(http, proxy_country)
+    log(f"Checkout 出口预检通过：{stripe.proxy_exit_log_label(checkout_info)}")
     stripe.verify_chatgpt_account(
-        checkout_http,
+        http,
         access_token,
-        country=checkout_country,
+        country=proxy_country,
         device_id=device_id,
     )
     log("ChatGPT /me 账号与连接预检通过")
@@ -108,15 +104,24 @@ def resolve_paypal_approval_url(
     redirect_url: str,
     *,
     max_hops: int = 6,
+    log: LogFn = lambda _message: None,
 ) -> tuple[str, str]:
     current = html.unescape(str(redirect_url or "").strip())
     if not current:
-        raise RuntimeError("Stripe 未返回跳转地址")
+        raise RuntimeError("OAICS 未返回 PayPal 跳转地址")
 
     for _hop in range(max(1, max_hops) + 1):
         if "paypal.com/agreements/approve" in current.lower():
             token = _ba_from_url(current)
             if token:
+                stripe._protocol_diagnostic(
+                    log,
+                    kind="paypal_redirect",
+                    method="GET",
+                    route="paypal/agreements/approve",
+                    request_payload={"hop": _hop, "url": current},
+                    response_payload={"ba_token_found": True},
+                )
                 return current, token
         response = http.get(
             current,
@@ -130,6 +135,20 @@ def resolve_paypal_approval_url(
         location = str((getattr(response, "headers", {}) or {}).get("location") or "")
         body = html.unescape(str(getattr(response, "text", "") or ""))
         match = _PAYPAL_URL_RE.search(body)
+        stripe._protocol_diagnostic(
+            log,
+            kind="paypal_redirect",
+            method="GET",
+            route=urlsplit(current).path or "/",
+            status=getattr(response, "status_code", 0),
+            request_payload={"hop": _hop, "url": current},
+            response_payload={
+                "location": location,
+                "paypal_url_in_body": bool(match),
+                "ba_token_in_body": bool(_BA_TOKEN_RE.search(body)),
+            },
+            response=response,
+        )
         if match:
             approval = match.group(0).replace("\\u0026", "&").replace("\\/", "/")
             token = _ba_from_url(approval)
@@ -143,7 +162,7 @@ def resolve_paypal_approval_url(
             break
         current = urljoin(current, html.unescape(location))
 
-    raise RuntimeError("未能从 Stripe 跳转解析 PayPal BA 链接")
+    raise RuntimeError("未能从 OAICS 跳转解析 PayPal BA 链接")
 
 
 class LiveProtocolGateway:
@@ -151,27 +170,26 @@ class LiveProtocolGateway:
         self,
         *,
         access_token: str,
-        country: CountryProfile,
+        proxy_country: CountryProfile,
+        checkout_country: CountryProfile,
+        billing: dict,
         proxy: ProxyEndpoint,
         device_id: str,
-        promo_proxy: ProxyEndpoint | None = None,
-        promo_country: CountryProfile | None = None,
         log: LogFn,
     ) -> CheckoutArtifact:
         http = stripe.build_http(proxy.url)
-        if promo_proxy is None:
-            http.close()
-            raise ValueError("需要单独的优惠 update 代理")
-        promo_http = stripe.build_http(promo_proxy.url)
         keep_checkout_http = False
         context: dict[str, str] = {}
+
+        def renew_checkout_http(current):
+            nonlocal http
+            http = stripe.renew_http_session(current, proxy.url)
+            return http
+
         try:
-            update_country = (promo_country or country).code
             preflight_checkout_route(
-                checkout_http=http,
-                checkout_country=country.code,
-                promo_http=promo_http,
-                promo_country=update_country,
+                http=http,
+                proxy_country=proxy_country.code,
                 access_token=access_token,
                 device_id=device_id,
                 log=log,
@@ -179,69 +197,84 @@ class LiveProtocolGateway:
             session_id, error = stripe.create_chatgpt_order_with_retry(
                 http,
                 access_token,
-                country=country.code,
-                currency=country.currency,
+                country=checkout_country.code,
+                currency=checkout_country.currency,
                 device_id=device_id,
                 sentinel_proxy=proxy.url,
                 checkout_context=context,
-                with_promo=False,
+                with_promo=True,
                 max_attempts=3,
+                renew_http=renew_checkout_http,
                 log=log,
             )
             if not session_id:
                 raise RuntimeError(f"创建 Checkout 失败: {error or '没有 session id'}")
-            processor_entity = context.get("processor_entity") or country.processor_entity
-            pk = context.get("publishable_key") or stripe.verify_pk(
-                http,
-                session_id,
-                lambda _message: None,
+            if not session_id.startswith("oaics_"):
+                raise stripe.OaicsCheckoutRequiredError(session_id)
+            processor_entity = (
+                context.get("processor_entity") or checkout_country.processor_entity
             )
-            stripe.init_checkout(
+            state = stripe.fetch_oaics_checkout_session(
                 http,
-                session_id,
-                pk,
-                stripe._profile(country.code),
-                lambda _message: None,
-            )
-            stripe.update_chatgpt_checkout_promotion(
-                promo_http,
                 access_token,
                 session_id,
-                processor_entity=processor_entity,
-                country=update_country,
+                processor_entity,
+                country=checkout_country.code,
                 device_id=device_id,
-                billing_country=country.code,
-                billing_currency=country.currency,
                 log=log,
             )
-            stripe.verify_promo_checkout_zero(
+            tax_state = stripe.submit_oaics_checkout_taxes(
                 http,
+                access_token,
                 session_id,
-                country=country.code,
-                publishable_key=pk,
-                log=lambda _message: None,
+                processor_entity,
+                billing=billing,
+                country=checkout_country.code,
+                currency=checkout_country.currency,
+                device_id=device_id,
+                log=log,
             )
-            checkout_url = context.get("checkout_url") or (
+            state = stripe.wait_for_oaics_zero(
+                http,
+                access_token,
+                session_id,
+                processor_entity,
+                country=checkout_country.code,
+                currency=checkout_country.currency,
+                device_id=device_id,
+                initial_payload=tax_state or state,
+                log=log,
+            )
+            detected_currency = stripe.oaics_checkout_currency(state)
+            if detected_currency and detected_currency != checkout_country.currency:
+                raise RuntimeError(
+                    "OAICS 币种与账单国家不一致: "
+                    f"expected={checkout_country.currency}, actual={detected_currency}"
+                )
+            canonical_checkout_url = (
                 f"https://chatgpt.com/checkout/{processor_entity}/{session_id}"
+            )
+            response_checkout_url = context.get("checkout_url") or ""
+            checkout_url = (
+                response_checkout_url
+                if session_id in response_checkout_url
+                else canonical_checkout_url
             )
             transport = CheckoutTransport(http=http, proxy_url=proxy.url)
             keep_checkout_http = True
             return CheckoutArtifact(
                 session_id=session_id,
                 processor_entity=processor_entity,
-                checkout_country=country.code,
-                currency=country.currency,
+                country=checkout_country.code,
+                currency=detected_currency or checkout_country.currency,
                 checkout_url=checkout_url,
                 amount=0,
-                publishable_key=pk,
                 transport=transport,
             )
         finally:
-            for client in (promo_http, None if keep_checkout_http else http):
-                if client is None:
-                    continue
+            if not keep_checkout_http:
                 try:
-                    client.close()
+                    http.close()
                 except Exception:
                     pass
 
@@ -250,7 +283,8 @@ class LiveProtocolGateway:
         *,
         artifact: CheckoutArtifact,
         access_token: str,
-        country: CountryProfile,
+        proxy_country: CountryProfile,
+        checkout_country: CountryProfile,
         billing: dict,
         proxy: ProxyEndpoint,
         device_id: str,
@@ -264,35 +298,37 @@ class LiveProtocolGateway:
         try:
             check_cancelled()
             if not reused_checkout_transport:
-                info = stripe.verify_proxy_exit_country(http, country.code)
+                info = stripe.verify_proxy_exit_country(http, proxy_country.code)
                 log(f"提链出口预检通过：{stripe.proxy_exit_log_label(info)}")
                 stripe.verify_chatgpt_account(
                     http,
                     access_token,
-                    country=country.code,
+                    country=proxy_country.code,
                     device_id=device_id,
                 )
                 log("提链出口 ChatGPT /me 预检通过")
             else:
-                log("首次提链复用 Checkout 主链路会话")
-            redirect_url, _publishable_key, context = stripe.stripe_to_paypal_redirect(
+                log("首次提链复用 Checkout 会话")
+            redirect_url, _context = stripe.oaics_to_paypal_redirect(
                 http,
                 artifact.session_id,
-                billing=billing,
-                country=country.code,
-                processor_entity=artifact.processor_entity,
-                publishable_key=artifact.publishable_key,
-                require_zero_amount=True,
-                chatgpt_http=http,
                 access_token=access_token,
+                processor_entity=artifact.processor_entity,
+                billing=billing,
+                country=checkout_country.code,
+                currency=artifact.currency,
                 device_id=device_id,
                 sentinel_proxy=proxy.url,
-                log=lambda raw: log(raw.removeprefix("[stripe] ")),
+                log=lambda raw: log(raw.removeprefix("[oaics] ")),
             )
             check_cancelled()
-            approval_url, ba_token = resolve_paypal_approval_url(http, redirect_url)
+            approval_url, ba_token = resolve_paypal_approval_url(
+                http,
+                redirect_url,
+                log=log,
+            )
             return ProviderResult(
-                stripe_redirect_url=redirect_url,
+                provider_redirect_url=redirect_url,
                 paypal_approve_url=approval_url,
                 ba_token=ba_token,
             )

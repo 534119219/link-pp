@@ -4,7 +4,13 @@ import re
 
 import pytest
 
-from handoff.countries import COUNTRIES, get_country, install_protocol_profiles, list_countries
+from handoff.countries import (
+    COUNTRIES,
+    checkout_country_for_proxy,
+    get_country,
+    install_protocol_profiles,
+    list_countries,
+)
 
 
 def test_registry_has_broad_country_coverage_and_complete_profiles():
@@ -33,6 +39,14 @@ def test_thailand_paypal_profile_is_complete():
     assert thailand.currency == "THB"
     assert thailand.locale == "th-TH"
     assert thailand.timezone == "Asia/Bangkok"
+
+
+def test_brazil_proxy_uses_german_checkout_profile():
+    checkout = checkout_country_for_proxy(get_country("BR"))
+    assert checkout.code == "DE"
+    assert checkout.currency == "EUR"
+    assert checkout.processor_entity == "openai_ie"
+    assert checkout.billing_dict(name="Owner", email="owner@example.com")["address"]["country"] == "DE"
 
 
 def test_unknown_country_is_not_silently_mapped_to_us():

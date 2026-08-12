@@ -9,6 +9,8 @@ from .proxies import ProxyPool
 from .protocol.stripe_checkout import (
     ChatGPTAuthError,
     CheckoutPreflightError,
+    OaicsConfirmBlockedError,
+    PayPalFundingUnavailableError,
     PayPalRiskDeclinedError,
 )
 from .security import TokenProfile, mask_identifier, sanitize_message
@@ -39,10 +41,9 @@ EmitFn = Callable[[str, str, str], None]
 class RunSpec:
     access_token: str
     token_profile: TokenProfile
+    proxy_country: CountryProfile
     checkout_country: CountryProfile
-    promo_country: CountryProfile
-    checkout_proxies: ProxyPool
-    promo_proxies: ProxyPool
+    proxies: ProxyPool
     checkout_attempts: int = DEFAULT_CHECKOUT_ATTEMPTS
     provider_attempts: int = DEFAULT_PROVIDER_ATTEMPTS
     device_id: str = ""
@@ -55,11 +56,11 @@ class RunSpec:
 class FlowResult:
     session_id: str
     checkout_url: str
-    stripe_redirect_url: str
+    provider_redirect_url: str
     paypal_approve_url: str
     ba_token: str
-    checkout_country: str
-    promo_country: str
+    proxy_country: str
+    country: str
     currency: str
     checkout_attempt: int
     provider_attempt: int
@@ -90,7 +91,14 @@ def _is_auth_error(exc: BaseException) -> bool:
 
 
 def _requires_new_checkout(exc: BaseException) -> bool:
-    if isinstance(exc, PayPalRiskDeclinedError):
+    if isinstance(
+        exc,
+        (
+            OaicsConfirmBlockedError,
+            PayPalFundingUnavailableError,
+            PayPalRiskDeclinedError,
+        ),
+    ):
         return True
     text = str(exc).lower()
     return any(
@@ -103,6 +111,7 @@ def _requires_new_checkout(exc: BaseException) -> bool:
             "result=blocked",
             "checkout_not_active_session",
             "checkout session is no longer active",
+            "oaics paypal confirm blocked",
         )
     )
 
@@ -112,7 +121,13 @@ def _short_reason(exc: BaseException, access_token: str) -> str:
     lower = text.lower()
     if "checkout_not_active_session" in lower or "checkout session is no longer active" in lower:
         return "Checkout 已失效"
-    if "manual_approval approve blocked" in lower or "result=blocked" in lower:
+    if "普通 stripe checkout" in lower or "oaics_ 链" in lower:
+        return "上游返回普通 Stripe Checkout，未生成 oaics_ 链"
+    if (
+        "manual_approval approve blocked" in lower
+        or "result=blocked" in lower
+        or "oaics paypal confirm blocked" in lower
+    ):
         return "审批被拒绝"
     if "paypal 风控拒绝" in lower or "generic_decline" in lower:
         return "风控拒绝（generic_decline）"
@@ -120,12 +135,20 @@ def _short_reason(exc: BaseException, access_token: str) -> str:
         return "Stripe 分片 key 不匹配"
     if "payment_method_types_mismatch" in lower or "不支持 paypal" in lower:
         return "未开放 PayPal"
-    if "免费促销未实际生效" in text or "stripe due=" in lower:
-        return "金额不是 0"
+    if (
+        "免费促销未实际生效" in text
+        or "stripe due=" in lower
+        or "checkout due=" in lower
+    ):
+        return "已生成 OAICS，但前置优惠未生效（应付金额非 0）"
     if "ba 链接" in lower or "ba_token" in lower:
         return "没有解析到 BA 链接"
     if "confirm 未返回 paypal 跳转地址" in lower:
         return "未取得 PayPal 跳转地址"
+    if "bad_decrypt" in lower:
+        return "代理 TLS 解密异常（BAD_DECRYPT）"
+    if "connection closed abruptly" in lower:
+        return "代理连接被上游中断（curl 56）"
     network_markers = (
         "timeout",
         "timed out",
@@ -169,6 +192,7 @@ class HandoffEngine:
             email=spec.token_profile.email,
         )
         last_error: BaseException | None = None
+        last_provider_error: BaseException | None = None
         active_artifact: CheckoutArtifact | None = None
 
         def close_active_artifact() -> None:
@@ -185,31 +209,30 @@ class HandoffEngine:
         checkout_attempt = 0
         candidate_sequence = 0
         consecutive_preflight_failures = 0
-        preflight_scan_limit = max(len(spec.checkout_proxies), len(spec.promo_proxies), 1)
+        preflight_scan_limit = max(len(spec.proxies), 1)
 
         while checkout_attempt < spec.checkout_attempts:
             check_cancelled()
             close_active_artifact()
             candidate_sequence += 1
             device_id = fixed_device_id or new_device_id()
-            checkout_proxy = spec.checkout_proxies.pick(candidate_sequence)
-            promo_proxy = spec.promo_proxies.pick(candidate_sequence)
+            checkout_proxy = spec.proxies.pick(candidate_sequence)
             displayed_attempt = checkout_attempt + 1
             emit(
                 "info",
                 "checkout",
                 f"生成 Checkout {displayed_attempt}/{spec.checkout_attempts}"
-                f"（{spec.checkout_country.code} 主链路 · "
-                f"{spec.promo_country.code} 优惠 update）",
+                f"（{spec.proxy_country.code} 出口 · "
+                f"{spec.checkout_country.code}/{spec.checkout_country.currency} 账单）",
             )
             try:
                 artifact = self.gateway.create_checkout(
                     access_token=token,
-                    country=spec.checkout_country,
+                    proxy_country=spec.proxy_country,
+                    checkout_country=spec.checkout_country,
+                    billing=billing,
                     proxy=checkout_proxy,
                     device_id=device_id,
-                    promo_proxy=promo_proxy,
-                    promo_country=spec.promo_country,
                     log=lambda message: emit(
                         "info",
                         "checkout",
@@ -253,7 +276,7 @@ class HandoffEngine:
                 provider_proxy = (
                     checkout_proxy
                     if provider_attempt == 1
-                    else spec.checkout_proxies.pick(candidate_sequence + provider_attempt - 1)
+                    else spec.proxies.pick(candidate_sequence + provider_attempt - 1)
                 )
                 emit(
                     "info",
@@ -265,7 +288,8 @@ class HandoffEngine:
                     result = self.gateway.attempt_provider(
                         artifact=artifact,
                         access_token=token,
-                        country=spec.checkout_country,
+                        proxy_country=spec.proxy_country,
+                        checkout_country=spec.checkout_country,
                         billing=billing,
                         proxy=provider_proxy,
                         device_id=device_id,
@@ -281,11 +305,16 @@ class HandoffEngine:
                         ),
                     )
                     if not result.paypal_approve_url or not result.ba_token:
-                        raise RuntimeError("未能从 Stripe 跳转解析 PayPal BA 链接")
+                        raise RuntimeError("未能从 OAICS 跳转解析 PayPal BA 链接")
                 except CancelledError:
                     raise
                 except Exception as exc:
                     last_error = exc
+                    if _short_reason(exc, token) != "代理连接失败" and not any(
+                        marker in str(exc).lower()
+                        for marker in ("bad_decrypt", "connection closed abruptly")
+                    ):
+                        last_provider_error = exc
                     reason = _short_reason(exc, token)
                     if _is_auth_error(exc):
                         close_active_artifact()
@@ -294,9 +323,9 @@ class HandoffEngine:
                         emit("warn", "extract", f"{reason}，当前 Checkout 不再重试")
                         break
                     if provider_attempt < spec.provider_attempts:
-                        emit("warn", "extract", f"{reason}，更换主链路出口")
+                        emit("warn", "extract", f"{reason}，更换代理出口")
                     else:
-                        emit("warn", "extract", f"{reason}，本轮主链路出口已用完")
+                        emit("warn", "extract", f"{reason}，本轮代理出口已用完")
                     continue
 
                 emit("success", "extract", "已取得 PayPal BA 链接")
@@ -304,11 +333,11 @@ class HandoffEngine:
                 return FlowResult(
                     session_id=artifact.session_id,
                     checkout_url=artifact.checkout_url,
-                    stripe_redirect_url=result.stripe_redirect_url,
+                    provider_redirect_url=result.provider_redirect_url,
                     paypal_approve_url=result.paypal_approve_url,
                     ba_token=result.ba_token,
-                    checkout_country=spec.checkout_country.code,
-                    promo_country=spec.promo_country.code,
+                    proxy_country=spec.proxy_country.code,
+                    country=spec.checkout_country.code,
                     currency=artifact.currency,
                     checkout_attempt=checkout_attempt,
                     provider_attempt=provider_attempt,
@@ -317,7 +346,8 @@ class HandoffEngine:
             if checkout_attempt < spec.checkout_attempts:
                 emit("info", "checkout", "未取得 PayPal 链接，重新生成 Checkout")
 
-        reason = _short_reason(last_error, token) if last_error else "没有可用结果"
+        final_error = last_provider_error or last_error
+        reason = _short_reason(final_error, token) if final_error else "没有可用结果"
         close_active_artifact()
         raise FlowExhaustedError(
             f"已完成 {checkout_attempt} 次 Checkout，仍未取得 PayPal 链接：{reason}"

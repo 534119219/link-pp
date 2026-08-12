@@ -75,14 +75,6 @@
     } catch { return null; }
   }
 
-  function maskEmail(email) {
-    if (!email) return "";
-    const [local, domain] = email.split("@");
-    if (!domain) return email;
-    const visible = local.length > 2 ? local.slice(0, 2) : local.slice(0, 1);
-    return `${visible}***@${domain}`;
-  }
-
   // ─── Proxy Parser ─────────────────────────────────────────────────
   const SUPPORTED_SCHEMES = new Set(["socks5", "socks5h", "http", "https"]);
   const SCHEME_ALIASES = { socket5: "socks5", socks: "socks5" };
@@ -272,7 +264,9 @@
       codeInput.value = c.code;
       label.textContent = `${COUNTRY_FLAGS[c.code] || ""} ${c.name} (${c.code})`;
       if (detail && detailText) {
-        detailText.textContent = `${c.currency} · ${c.locale} · ${c.timezone} · ${c.processor_entity}`;
+        detailText.textContent = c.checkout_country === c.code
+          ? `${c.currency} · ${c.locale} · ${c.timezone} · ${c.processor_entity}`
+          : `${c.code} 出口 · ${c.checkout_country}/${c.checkout_currency} 账单`;
         detail.hidden = false;
       }
       dropdown.hidden = true;
@@ -309,9 +303,7 @@
   }
 
   const setCk = setupCountryPicker("ckPickerBtn","ckPickerLabel","ckCode","ckDropdown","ckSearch","ckList","ckDetail","ckDetailText");
-  const setPm = setupCountryPicker("pmPickerBtn","pmPickerLabel","pmCode","pmDropdown","pmSearch","pmList","pmDetail","pmDetailText");
   const setBCk = setupCountryPicker("bCkPickerBtn","bCkPickerLabel","bCkCode","bCkDropdown","bCkSearch","bCkList",null,null);
-  const setBPm = setupCountryPicker("bPmPickerBtn","bPmPickerLabel","bPmCode","bPmDropdown","bPmSearch","bPmList",null,null);
 
   // ─── Status ────────────────────────────────────────────────────────
   function setStatus(s, t) { $("statusChip").dataset.status = s; $("statusText").textContent = t; }
@@ -322,7 +314,7 @@
   function updateATProfile() {
     const p = parseATProfile(atInput.value);
     if (p) {
-      $("atEmail").textContent = maskEmail(p.email);
+      $("atEmail").textContent = p.email;
       $("atName").textContent = p.name;
       atProfile.hidden = false;
     } else {
@@ -345,7 +337,7 @@
       count++;
       const p = parseATProfile(line);
       if (p) {
-        html += `<div class="at-batch-item"><span class="at-line-num">${count}</span><span class="at-line-email">${esc(maskEmail(p.email))}</span></div>`;
+        html += `<div class="at-batch-item"><span class="at-line-num">${count}</span><span class="at-line-email">${esc(p.email)}</span></div>`;
       } else {
         html += `<div class="at-batch-item invalid"><span class="at-line-num">${count}</span><span>格式无效</span></div>`;
       }
@@ -359,11 +351,9 @@
   batchTokensEl.addEventListener("input", updateBatchTokenPreview);
 
   // ─── Proxy Input Handlers ──────────────────────────────────────────
-  let ckProxyTimer, pmProxyTimer;
+  let ckProxyTimer;
   $("ckProxies").addEventListener("input", () => { clearTimeout(ckProxyTimer); ckProxyTimer = setTimeout(() => renderProxyPreview("ckProxies","ckProxyBody","ckProxyPreview","ckCount",$("ckScheme").value), 300); });
-  $("pmProxies").addEventListener("input", () => { clearTimeout(pmProxyTimer); pmProxyTimer = setTimeout(() => renderProxyPreview("pmProxies","pmProxyBody","pmProxyPreview","pmCount",$("pmScheme").value), 300); });
   $("ckScheme").addEventListener("change", () => renderProxyPreview("ckProxies","ckProxyBody","ckProxyPreview","ckCount",$("ckScheme").value));
-  $("pmScheme").addEventListener("change", () => renderProxyPreview("pmProxies","pmProxyBody","pmProxyPreview","pmCount",$("pmScheme").value));
 
   // ─── Log Filters ───────────────────────────────────────────────────
   $("logFilters").addEventListener("click", (e) => {
@@ -379,14 +369,12 @@
   function closeES() { state.es?.close(); state.es = null; }
 
   function singlePayload() {
-    if (!$("ckCode").value) throw new Error("请选择主链路国家");
-    if (!$("pmCode").value) throw new Error("请选择优惠国家");
-    if (!$("ckProxies").value.trim()) throw new Error("请填写主链路代理");
-    if (!$("pmProxies").value.trim()) throw new Error("请填写优惠代理");
+    if (!$("ckCode").value) throw new Error("请选择国家");
+    if (!$("ckProxies").value.trim()) throw new Error("请填写代理");
     return {
-      checkout_country: $("ckCode").value, promo_country: $("pmCode").value,
-      checkout_proxy_scheme: $("ckScheme").value, promo_proxy_scheme: $("pmScheme").value,
-      checkout_proxies: $("ckProxies").value, promo_proxies: $("pmProxies").value,
+      country: $("ckCode").value,
+      proxy_scheme: $("ckScheme").value,
+      proxies: $("ckProxies").value,
       checkout_attempts: $("ckAttempts").value, provider_attempts: $("pvAttempts").value,
     };
   }
@@ -415,14 +403,14 @@
     src.addEventListener("result", e => {
       const r = JSON.parse(e.data).data;
       renderResult(r);
-      addHistory({ type: "single", status: "success", email: maskEmail(parseATProfile(atInput.value)?.email || ""), result: r, time: nowISO() });
+      addHistory({ type: "single", status: "success", email: parseATProfile(atInput.value)?.email || "", result: r, time: nowISO() });
     });
     src.addEventListener("done", e => {
       closeES(); state.jobId = "";
       $("singleStopBtn").disabled = true; $("singleStartBtn").disabled = false;
       const d = JSON.parse(e.data).data;
       if (d.status === "failed" || d.status === "cancelled") {
-        addHistory({ type: "single", status: d.status, email: maskEmail(parseATProfile(atInput.value)?.email || ""), error: "任务" + (d.status === "failed" ? "失败" : "停止"), time: nowISO() });
+        addHistory({ type: "single", status: d.status, email: parseATProfile(atInput.value)?.email || "", error: "任务" + (d.status === "failed" ? "失败" : "停止"), time: nowISO() });
       }
     });
     src.onerror = () => { if (state.jobId) mainLog.push({ time: nowTime(), level: "warn", stage: "stream", message: "连接中断，尝试重连..." }); };
@@ -430,11 +418,11 @@
 
   function renderResult(r) {
     setLink($("rPaypal"), r.paypal_approve_url);
-    setLink($("rStripe"), r.stripe_redirect_url);
+    setLink($("rProvider"), r.provider_redirect_url);
     setLink($("rCheckout"), r.checkout_url);
     $("rBaToken").textContent = r.ba_token || "-";
     $("rSession").textContent = r.session_id || "-";
-    $("rRoute").textContent = `${r.checkout_country} → ${r.promo_country} · ${r.currency}`;
+    $("rRoute").textContent = `${r.proxy_country || ""} 出口 · ${r.country} · ${r.currency}`;
     $("singleResultCard").hidden = false;
   }
   function setLink(a, url) { url = String(url || ""); a.href = url || "#"; a.textContent = url || "—"; }
@@ -491,14 +479,12 @@
 
   // ─── Batch Tab ─────────────────────────────────────────────────────
   function batchPayload() {
-    if (!$("bCkCode").value) throw new Error("请选择主链路国家");
-    if (!$("bPmCode").value) throw new Error("请选择优惠国家");
-    if (!$("bCkProxies").value.trim()) throw new Error("请填写主链路代理");
-    if (!$("bPmProxies").value.trim()) throw new Error("请填写优惠代理");
+    if (!$("bCkCode").value) throw new Error("请选择国家");
+    if (!$("bCkProxies").value.trim()) throw new Error("请填写代理");
     return {
-      checkout_country: $("bCkCode").value, promo_country: $("bPmCode").value,
-      checkout_proxy_scheme: "socks5", promo_proxy_scheme: "socks5",
-      checkout_proxies: $("bCkProxies").value, promo_proxies: $("bPmProxies").value,
+      country: $("bCkCode").value,
+      proxy_scheme: $("bScheme").value,
+      proxies: $("bCkProxies").value,
       checkout_attempts: $("bCkAttempts").value, provider_attempts: $("bPvAttempts").value,
     };
   }
@@ -538,6 +524,13 @@
     sel.value = state.batchId;
   }
 
+  function terminalReason(error) {
+    const text = String(error || "").trim();
+    const marker = "仍未取得 PayPal 链接：";
+    const markerAt = text.lastIndexOf(marker);
+    return markerAt >= 0 ? text.slice(markerAt + marker.length) : (text || "—");
+  }
+
   function renderBatch(b) {
     state.batch = b;
     // Progress
@@ -567,8 +560,10 @@
     let html = "";
     for (const j of jobs) {
       const active = j.id === state.bjJobId ? " active" : "";
-      const resultUrl = j.result?.paypal_approve_url || j.result?.stripe_redirect_url || "";
-      const resultHtml = resultUrl ? `<button class="btn btn-sm btn-copy" data-copy-text="${encodeURIComponent(resultUrl)}">复制BA</button>` : `<span style="color:var(--text-muted)">${esc((j.error || "—").slice(0, 30))}</span>`;
+      const resultUrl = j.result?.paypal_approve_url || j.result?.provider_redirect_url || "";
+      const resultHtml = resultUrl
+        ? `<button class="btn btn-sm btn-copy" data-copy-text="${encodeURIComponent(resultUrl)}">复制BA</button>`
+        : `<span class="job-reason" title="${esc(j.error || "")}">${esc(j.failure_reason || terminalReason(j.error))}</span>`;
       html += `<div class="batch-job-item${active}" data-job="${j.id}">
         <span class="job-account">${esc(j.label || "#" + j.batch_index)}</span>
         <span class="job-status" data-s="${j.status}">${j.status}</span>
@@ -699,10 +694,10 @@
   $("historyExport").addEventListener("click", () => {
     const list = getHistory().filter(h => h.status === "success" && h.result);
     if (!list.length) { toast("没有可导出的成功记录", "error"); return; }
-    let csv = "﻿时间,邮箱,BA Token,PayPal链接,Checkout国家,优惠国家\n";
+    let csv = "﻿时间,邮箱,BA Token,PayPal链接,国家\n";
     for (const h of list) {
       const r = h.result || {};
-      csv += `"${h.time}","${h.email}","${r.ba_token || ""}","${r.paypal_approve_url || ""}","${r.checkout_country || ""}","${r.promo_country || ""}"\n`;
+      csv += `"${h.time}","${h.email}","${r.ba_token || ""}","${r.paypal_approve_url || ""}","${r.country || ""}"\n`;
     }
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
@@ -733,9 +728,9 @@
       html += '<div class="detail-section"><h4>结果</h4><dl class="detail-kv">';
       html += `<dt>BA Token</dt><dd>${esc(h.result.ba_token || "")}</dd>`;
       html += `<dt>PayPal</dt><dd>${esc(h.result.paypal_approve_url || "")}</dd>`;
-      html += `<dt>Stripe</dt><dd>${esc(h.result.stripe_redirect_url || "")}</dd>`;
+      html += `<dt>Provider</dt><dd>${esc(h.result.provider_redirect_url || "")}</dd>`;
       html += `<dt>Session</dt><dd>${esc(h.result.session_id || "")}</dd>`;
-      html += `<dt>链路</dt><dd>${esc(h.result.checkout_country || "")} → ${esc(h.result.promo_country || "")}</dd>`;
+      html += `<dt>链路</dt><dd>${esc(h.result.proxy_country || "")} 出口 · ${esc(h.result.country || "")} · ${esc(h.result.currency || "")}</dd>`;
       html += "</dl></div>";
     }
     body.innerHTML = html;
@@ -749,11 +744,12 @@
   function savePrefs() {
     try {
       localStorage.setItem(PREFS_KEY, JSON.stringify({
-        ckCode: $("ckCode").value, pmCode: $("pmCode").value,
-        bCkCode: $("bCkCode").value, bPmCode: $("bPmCode").value,
-        ckScheme: $("ckScheme").value, pmScheme: $("pmScheme").value,
-        ckProxies: $("ckProxies").value, pmProxies: $("pmProxies").value,
-        bCkProxies: $("bCkProxies").value, bPmProxies: $("bPmProxies").value,
+        country: $("ckCode").value,
+        batchCountry: $("bCkCode").value,
+        proxyScheme: $("ckScheme").value,
+        batchProxyScheme: $("bScheme").value,
+        proxies: $("ckProxies").value,
+        batchProxies: $("bCkProxies").value,
         ckAttempts: $("ckAttempts").value, pvAttempts: $("pvAttempts").value,
         bCkAttempts: $("bCkAttempts").value, bPvAttempts: $("bPvAttempts").value,
         bConcurrency: $("bConcurrency").value,
@@ -764,23 +760,30 @@
     try {
       const p = JSON.parse(localStorage.getItem(PREFS_KEY));
       if (!p) return null;
-      if (p.ckScheme) $("ckScheme").value = p.ckScheme;
-      if (p.pmScheme) $("pmScheme").value = p.pmScheme;
-      if (p.ckProxies) $("ckProxies").value = p.ckProxies;
-      if (p.pmProxies) $("pmProxies").value = p.pmProxies;
-      if (p.bCkProxies) $("bCkProxies").value = p.bCkProxies;
-      if (p.bPmProxies) $("bPmProxies").value = p.bPmProxies;
+      const normalized = {
+        ...p,
+        country: p.country || p.ckCode || "",
+        batchCountry: p.batchCountry || p.bCkCode || p.country || p.ckCode || "",
+        proxyScheme: p.proxyScheme || p.ckScheme || "",
+        batchProxyScheme: p.batchProxyScheme || p.proxyScheme || p.ckScheme || "",
+        proxies: p.proxies || p.ckProxies || "",
+        batchProxies: p.batchProxies || p.bCkProxies || "",
+      };
+      if (normalized.proxyScheme) $("ckScheme").value = normalized.proxyScheme;
+      if (normalized.batchProxyScheme) $("bScheme").value = normalized.batchProxyScheme;
+      if (normalized.proxies) $("ckProxies").value = normalized.proxies;
+      if (normalized.batchProxies) $("bCkProxies").value = normalized.batchProxies;
       if (p.ckAttempts) $("ckAttempts").value = p.ckAttempts;
       if (p.pvAttempts) $("pvAttempts").value = p.pvAttempts;
       if (p.bCkAttempts) $("bCkAttempts").value = p.bCkAttempts;
       if (p.bPvAttempts) $("bPvAttempts").value = p.bPvAttempts;
       if (p.bConcurrency) $("bConcurrency").value = p.bConcurrency;
-      return p;
+      return normalized;
     } catch { return null; }
   }
 
   // Auto-save on changes
-  ["ckScheme","pmScheme","ckProxies","pmProxies","bCkProxies","bPmProxies","ckAttempts","pvAttempts","bCkAttempts","bPvAttempts","bConcurrency"].forEach(id => {
+  ["ckScheme","bScheme","ckProxies","bCkProxies","ckAttempts","pvAttempts","bCkAttempts","bPvAttempts","bConcurrency"].forEach(id => {
     $(id).addEventListener("change", savePrefs);
     if ($(id).tagName === "TEXTAREA") $(id).addEventListener("input", savePrefs);
   });
@@ -792,12 +795,11 @@
     state.meta = meta;
     meta.countries.forEach(c => state.countries.set(c.code, c));
     // Set defaults
-    const ckDefault = prefs?.ckCode || meta.defaults.checkout_country;
-    const pmDefault = prefs?.pmCode || meta.defaults.promo_country;
+    const ckDefault = prefs?.country || meta.defaults.country;
     setCk(state.countries.get(ckDefault));
-    setPm(state.countries.get(pmDefault));
-    setBCk(state.countries.get(prefs?.bCkCode || ckDefault));
-    setBPm(state.countries.get(prefs?.bPmCode || pmDefault));
+    setBCk(state.countries.get(prefs?.batchCountry || ckDefault));
+    if (!prefs?.proxyScheme) $("ckScheme").value = meta.defaults.proxy_scheme;
+    if (!prefs?.batchProxyScheme) $("bScheme").value = meta.defaults.proxy_scheme;
     if (!prefs) {
       $("ckAttempts").value = meta.defaults.checkout_attempts;
       $("pvAttempts").value = meta.defaults.provider_attempts;
@@ -808,7 +810,6 @@
     $("bConcurrency").max = meta.max_batch_concurrency;
     // Render proxy previews for restored values
     if ($("ckProxies").value) renderProxyPreview("ckProxies","ckProxyBody","ckProxyPreview","ckCount",$("ckScheme").value);
-    if ($("pmProxies").value) renderProxyPreview("pmProxies","pmProxyBody","pmProxyPreview","pmCount",$("pmScheme").value);
   }).catch(err => toast("加载配置失败: " + err.message, "error"));
 
 })();
