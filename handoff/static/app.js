@@ -4,7 +4,7 @@
   const $ = (id) => document.getElementById(id);
   const LINE_H = 24;
   const MAX_LOG = 2000;
-  const BATCH_POLL_MS = 2500;
+  const BATCH_POLL_MS = 1000;
   const HISTORY_KEY = "handoff_history";
   const PREFS_KEY = "handoff_prefs";
   const MAX_HISTORY = 200;
@@ -223,7 +223,10 @@
     batchId: "",
     batch: null,
     batchTimer: null,
+    batchRequest: null,
+    batchRevision: 0,
     bjJobId: "",
+    batchLogRequest: null,
   };
 
   const mainLog = new VLog($("logContainer"));
@@ -231,6 +234,11 @@
 
   // ─── Tab Router ────────────────────────────────────────────────────
   function switchTab(tab) {
+    if (tab !== "batch") {
+      stopBatchPolling();
+      state.batchLogRequest?.abort();
+      state.batchLogRequest = null;
+    }
     state.currentTab = tab;
     document.querySelectorAll(".tab").forEach(t => {
       t.classList.toggle("active", t.dataset.tab === tab);
@@ -241,7 +249,11 @@
       p.hidden = !p.classList.contains("active");
     });
     if (tab === "history") renderHistory();
-    if (tab === "batch") refreshBatchList().catch(() => {});
+    if (tab === "batch") {
+      refreshBatchList()
+        .then(() => state.currentTab === "batch" && refreshBatch({ force: true }))
+        .catch(() => {});
+    }
   }
   document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () => switchTab(t.dataset.tab)));
 
@@ -503,9 +515,10 @@
       };
       const res = await api("/api/batches", { method: "POST", body: JSON.stringify(body) });
       state.batchId = res.id;
+      state.batchRevision = 0;
       toast("批次已提交", "success");
       await refreshBatchList();
-      await refreshBatch();
+      await refreshBatch({ force: true });
       addHistory({ type: "batch", status: "running", name: $("batchName").value.trim() || `批次 ${res.id.slice(0,8)}`, total: res.total, time: nowISO(), batchId: res.id });
     } catch (err) {
       $("batchFormErr").textContent = err.message; $("batchFormErr").hidden = false;
@@ -516,10 +529,23 @@
   async function refreshBatchList() {
     const res = await api("/api/batches");
     const list = res.batches || [];
-    if (!state.batchId && list.length) state.batchId = list[0].id;
     const sel = $("batchSel");
     sel.innerHTML = "";
-    if (!list.length) { sel.append(new Option("暂无批次", "")); return; }
+    if (!list.length) {
+      stopBatchPolling();
+      state.batchId = "";
+      state.batchRevision = 0;
+      state.batch = null;
+      sel.append(new Option("暂无批次", ""));
+      return;
+    }
+    const nextBatchId = list.some(b => b.id === state.batchId) ? state.batchId : list[0].id;
+    if (nextBatchId !== state.batchId) {
+      stopBatchPolling();
+      state.batchId = nextBatchId;
+      state.batchRevision = 0;
+      state.batch = null;
+    }
     list.forEach(b => sel.append(new Option(`${b.name} · ${b.status}`, b.id)));
     sel.value = state.batchId;
   }
@@ -531,6 +557,78 @@
     return markerAt >= 0 ? text.slice(markerAt + marker.length) : (text || "—");
   }
 
+  function setText(id, value) {
+    const el = $(id);
+    const text = String(value);
+    if (el.textContent !== text) el.textContent = text;
+  }
+
+  function updateBatchJobRow(row, job) {
+    const resultUrl = job.result_url || job.result?.paypal_approve_url || job.result?.provider_redirect_url || "";
+    const reason = job.failure_reason || terminalReason(job.error);
+    const active = job.id === state.bjJobId;
+    const signature = JSON.stringify([job.label, job.status, job.attempt, resultUrl, reason, active]);
+    if (row.dataset.signature === signature) return;
+    row.dataset.signature = signature;
+    row.classList.toggle("active", active);
+    row.querySelector(".job-account").textContent = job.label || "#" + job.batch_index;
+    const status = row.querySelector(".job-status");
+    status.dataset.s = job.status;
+    status.textContent = job.status;
+    row.querySelector(".job-attempt").textContent = `#${job.attempt || 1}`;
+    const result = row.querySelector(".job-result");
+    if (resultUrl) {
+      const button = document.createElement("button");
+      button.className = "btn btn-sm btn-copy";
+      button.dataset.copyText = encodeURIComponent(resultUrl);
+      button.textContent = "复制BA";
+      result.replaceChildren(button);
+    } else {
+      const message = document.createElement("span");
+      message.className = "job-reason";
+      message.title = reason;
+      message.textContent = reason;
+      result.replaceChildren(message);
+    }
+  }
+
+  function createBatchJobRow(job) {
+    const row = document.createElement("div");
+    row.className = "batch-job-item";
+    row.dataset.job = job.id;
+    row.innerHTML = '<span class="job-account"></span><span class="job-status"></span><span class="job-attempt"></span><span class="job-result"></span>';
+    updateBatchJobRow(row, job);
+    return row;
+  }
+
+  function renderBatchJobs(batch) {
+    const filter = $("batchJobFilter").value;
+    const jobs = (batch.jobs || []).filter(job => filter === "all" || job.status === filter);
+    const list = $("batchJobList");
+    if (!jobs.length) {
+      if (!list.querySelector(".empty-state")) list.innerHTML = '<div class="empty-state">暂无匹配任务</div>';
+      return;
+    }
+
+    const existing = new Map(
+      [...list.querySelectorAll(".batch-job-item")].map(row => [row.dataset.job, row])
+    );
+    const currentIds = [...existing.keys()];
+    const structureChanged = currentIds.length !== jobs.length
+      || jobs.some((job, index) => currentIds[index] !== job.id);
+    if (structureChanged) {
+      const fragment = document.createDocumentFragment();
+      for (const job of jobs) {
+        const row = existing.get(job.id) || createBatchJobRow(job);
+        updateBatchJobRow(row, job);
+        fragment.appendChild(row);
+      }
+      list.replaceChildren(fragment);
+      return;
+    }
+    for (const job of jobs) updateBatchJobRow(existing.get(job.id), job);
+  }
+
   function renderBatch(b) {
     state.batch = b;
     // Progress
@@ -538,88 +636,120 @@
     const done = (b.counts?.success || 0) + (b.counts?.failed || 0) + (b.counts?.cancelled || 0);
     $("batchProgress").hidden = false;
     $("progressFill").style.width = total ? `${(done / total * 100).toFixed(1)}%` : "0";
-    $("progressText").textContent = `${done}/${total}`;
+    setText("progressText", `${done}/${total}`);
     // Stats
     $("batchStats").hidden = false;
-    $("sTotal").textContent = total;
-    $("sRunning").textContent = (b.counts?.running || 0) + (b.counts?.queued || 0);
-    $("sSuccess").textContent = b.counts?.success || 0;
-    $("sFailed").textContent = b.counts?.failed || 0;
-    $("sQueued").textContent = b.counts?.queued || 0;
+    setText("sTotal", total);
+    setText("sRunning", (b.counts?.running || 0) + (b.counts?.queued || 0));
+    setText("sSuccess", b.counts?.success || 0);
+    setText("sFailed", b.counts?.failed || 0);
+    setText("sQueued", b.counts?.queued || 0);
     // Actions
     const term = ["success","failed","cancelled","partial"].includes(b.status);
     $("batchCancel").disabled = term;
     $("batchRetry").disabled = !(b.retryable_count > 0 && term);
     $("batchDl").href = `/api/batches/${b.id}/results.csv`;
     $("batchDl").setAttribute("aria-disabled", "false");
-    // Job list
-    const filter = $("batchJobFilter").value;
-    const jobs = (b.jobs || []).filter(j => filter === "all" || j.status === filter);
-    const listEl = $("batchJobList");
-    if (!jobs.length) { listEl.innerHTML = '<div class="empty-state">暂无匹配任务</div>'; return; }
-    let html = "";
-    for (const j of jobs) {
-      const active = j.id === state.bjJobId ? " active" : "";
-      const resultUrl = j.result?.paypal_approve_url || j.result?.provider_redirect_url || "";
-      const resultHtml = resultUrl
-        ? `<button class="btn btn-sm btn-copy" data-copy-text="${encodeURIComponent(resultUrl)}">复制BA</button>`
-        : `<span class="job-reason" title="${esc(j.error || "")}">${esc(j.failure_reason || terminalReason(j.error))}</span>`;
-      html += `<div class="batch-job-item${active}" data-job="${j.id}">
-        <span class="job-account">${esc(j.label || "#" + j.batch_index)}</span>
-        <span class="job-status" data-s="${j.status}">${j.status}</span>
-        <span class="job-attempt">#${j.attempt || 1}</span>
-        <span class="job-result">${resultHtml}</span>
-      </div>`;
-    }
-    listEl.innerHTML = html;
+    renderBatchJobs(b);
   }
 
-  async function refreshBatch() {
-    if (!state.batchId) return;
+  function stopBatchPolling() {
+    clearTimeout(state.batchTimer);
+    state.batchTimer = null;
+    state.batchRequest?.abort();
+    state.batchRequest = null;
+  }
+
+  function scheduleBatchRefresh() {
+    clearTimeout(state.batchTimer);
+    if (state.currentTab !== "batch") return;
+    state.batchTimer = setTimeout(() => refreshBatch(), BATCH_POLL_MS);
+  }
+
+  async function refreshBatch({ force = false } = {}) {
+    const batchId = state.batchId;
+    if (!batchId) return;
+    if (force) stopBatchPolling();
+    if (state.batchRequest) return;
+    const controller = new AbortController();
+    state.batchRequest = controller;
     try {
-      const b = await api(`/api/batches/${state.batchId}`);
+      const revision = force ? 0 : state.batchRevision;
+      const query = new URLSearchParams({ compact: "1" });
+      if (revision) query.set("after_revision", revision);
+      const b = await api(`/api/batches/${batchId}?${query}`, { signal: controller.signal });
+      if (batchId !== state.batchId) return;
+      state.batchRevision = b.revision || state.batchRevision;
+      if (b.unchanged) {
+        scheduleBatchRefresh();
+        return;
+      }
       renderBatch(b);
       if (!["success","failed","cancelled","partial"].includes(b.status)) {
-        clearTimeout(state.batchTimer);
-        state.batchTimer = setTimeout(refreshBatch, BATCH_POLL_MS);
+        scheduleBatchRefresh();
       } else {
-        // Update history for this batch
-        updateHistoryBatch(state.batchId, b);
+        updateHistoryBatch(batchId, b);
       }
-    } catch { /* transient */ }
+    } catch (error) {
+      if (error.name !== "AbortError") scheduleBatchRefresh();
+    } finally {
+      if (state.batchRequest === controller) state.batchRequest = null;
+    }
   }
 
   async function selectBatchJob(jobId) {
     state.bjJobId = jobId;
+    if (state.batch) renderBatchJobs(state.batch);
     $("bjLabel").textContent = "任务 " + jobId.slice(0, 8);
     $("bjRefresh").disabled = false;
     if (!batchLog) batchLog = new VLog($("bjLogContainer"));
     batchLog.clear();
-    const res = await api(`/api/jobs/${jobId}/events.json?after=0`);
-    (res.events || []).filter(e => e.event === "log").forEach(e => {
-      batchLog.push({ time: e.timestamp?.slice(11, 19) || "", level: e.data?.level, stage: e.data?.stage, message: e.data?.message });
-    });
+    state.batchLogRequest?.abort();
+    const controller = new AbortController();
+    state.batchLogRequest = controller;
+    try {
+      const res = await api(`/api/jobs/${jobId}/events.json?after=0`, { signal: controller.signal });
+      if (state.bjJobId !== jobId) return;
+      (res.events || []).filter(e => e.event === "log").forEach(e => {
+        batchLog.push({ time: e.timestamp?.slice(11, 19) || "", level: e.data?.level, stage: e.data?.stage, message: e.data?.message });
+      });
+    } finally {
+      if (state.batchLogRequest === controller) state.batchLogRequest = null;
+    }
   }
 
-  $("batchRefresh").addEventListener("click", async () => { await refreshBatchList(); await refreshBatch(); });
-  $("batchSel").addEventListener("change", () => { state.batchId = $("batchSel").value; refreshBatch(); });
-  $("batchJobFilter").addEventListener("change", () => { if (state.batch) renderBatch(state.batch); });
+  $("batchRefresh").addEventListener("click", async () => { await refreshBatchList(); await refreshBatch({ force: true }); });
+  $("batchSel").addEventListener("change", () => {
+    stopBatchPolling();
+    state.batchId = $("batchSel").value;
+    state.batchRevision = 0;
+    state.batch = null;
+    refreshBatch({ force: true });
+  });
+  $("batchJobFilter").addEventListener("change", () => { if (state.batch) renderBatchJobs(state.batch); });
   $("batchCancel").addEventListener("click", async () => {
     if (!state.batchId) return;
     await api(`/api/batches/${state.batchId}/cancel`, { method: "POST", body: "{}" });
     toast("已发送停止请求", "info");
-    await refreshBatch();
+    await refreshBatch({ force: true });
   });
   $("batchRetry").addEventListener("click", async () => {
     if (!state.batchId) return;
     const res = await api(`/api/batches/${state.batchId}/retry`, { method: "POST", body: "{}" });
     toast(`已重试 ${res.created} 个任务`, "success");
-    await refreshBatch();
+    await refreshBatch({ force: true });
   });
-  $("bjRefresh").addEventListener("click", () => { if (state.bjJobId) selectBatchJob(state.bjJobId); });
+  $("bjRefresh").addEventListener("click", () => { if (state.bjJobId) selectBatchJob(state.bjJobId).catch(() => {}); });
   $("batchJobList").addEventListener("click", (e) => {
     const item = e.target.closest(".batch-job-item");
     if (item && item.dataset.job) selectBatchJob(item.dataset.job).catch(() => {});
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      stopBatchPolling();
+    } else if (state.currentTab === "batch" && state.batchId) {
+      refreshBatch({ force: true });
+    }
   });
 
   // ─── History ───────────────────────────────────────────────────────
@@ -783,9 +913,14 @@
   }
 
   // Auto-save on changes
+  let prefsTimer = null;
+  const scheduleSavePrefs = () => {
+    clearTimeout(prefsTimer);
+    prefsTimer = setTimeout(savePrefs, 250);
+  };
   ["ckScheme","bScheme","ckProxies","bCkProxies","ckAttempts","pvAttempts","bCkAttempts","bPvAttempts","bConcurrency"].forEach(id => {
     $(id).addEventListener("change", savePrefs);
-    if ($(id).tagName === "TEXTAREA") $(id).addEventListener("input", savePrefs);
+    if ($(id).tagName === "TEXTAREA") $(id).addEventListener("input", scheduleSavePrefs);
   });
 
   // ─── Init ──────────────────────────────────────────────────────────

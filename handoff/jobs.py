@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .engine import CancelledError, HandoffEngine, RunSpec
 from .security import sanitize_diagnostic_payload, sanitize_message
@@ -57,6 +57,7 @@ def _clone_spec(spec: RunSpec) -> RunSpec:
         checkout_attempts=spec.checkout_attempts,
         provider_attempts=spec.provider_attempts,
         device_id=spec.device_id,
+        proxy_offset=spec.proxy_offset,
     )
 
 
@@ -106,6 +107,7 @@ class Job:
         label: str = "",
         attempt: int = 1,
         retry_of: str = "",
+        on_change: Callable[[], None] | None = None,
     ):
         self.id = uuid.uuid4().hex
         self.batch_id = batch_id
@@ -138,6 +140,7 @@ class Job:
         self._events: list[JobEvent] = []
         self._seq = 0
         self._finished_epoch = 0.0
+        self._on_change = on_change
         self.add_event("state", {"status": "queued"})
 
     @property
@@ -172,7 +175,9 @@ class Job:
             if len(self._events) > 5000:
                 del self._events[: len(self._events) - 5000]
             self._condition.notify_all()
-            return item
+        if event in {"state", "result", "done"} and self._on_change is not None:
+            self._on_change()
+        return item
 
     def emit_log(self, level: str, stage: str, message: str) -> None:
         token = self._spec.access_token if self._spec is not None else ""
@@ -183,11 +188,7 @@ class Job:
             secrets=secrets,
             max_length=None,
         )
-        diagnostic = self._parse_confirm_diagnostic(
-            sanitized,
-            access_token=token,
-            secrets=secrets,
-        )
+        diagnostic = self._parse_confirm_diagnostic(sanitized)
         full_message = sanitized
         if diagnostic is not None:
             _kind, label, payload = diagnostic
@@ -221,16 +222,8 @@ class Job:
     @staticmethod
     def _parse_confirm_diagnostic(
         message: object,
-        *,
-        access_token: str,
-        secrets: tuple[str, ...],
     ) -> tuple[str, str, object] | None:
-        text = sanitize_message(
-            message,
-            access_token=access_token,
-            secrets=secrets,
-            max_length=None,
-        )
+        text = str(message or "")
         marker_at = text.find(_PROTOCOL_DIAGNOSTIC_MARKER)
         if marker_at >= 0:
             raw_payload = text[marker_at + len(_PROTOCOL_DIAGNOSTIC_MARKER) :]
@@ -323,6 +316,23 @@ class Job:
                 "last_seq": self._seq,
             }
 
+    def compact_snapshot(self) -> dict[str, Any]:
+        with self._condition:
+            result = self.result or {}
+            return {
+                "id": self.id,
+                "batch_index": self.batch_index or None,
+                "label": self.label or None,
+                "attempt": self.attempt,
+                "status": self.status,
+                "result_url": str(
+                    result.get("paypal_approve_url")
+                    or result.get("provider_redirect_url")
+                    or ""
+                ),
+                "failure_reason": _failure_reason(self.error) or None,
+            }
+
     def run(self, engine: HandoffEngine) -> None:
         spec = self._spec
         if spec is None:
@@ -371,6 +381,17 @@ class Batch:
         self._templates: dict[int, RetrySpec] = {}
         self._labels: dict[int, str] = {}
         self._attempts: dict[int, list[str]] = {}
+        self._revision = 1
+        self._revision_lock = threading.Lock()
+
+    @property
+    def revision(self) -> int:
+        with self._revision_lock:
+            return self._revision
+
+    def touch(self) -> None:
+        with self._revision_lock:
+            self._revision += 1
 
     def add_item(self, index: int, label: str, spec: RunSpec, job_id: str) -> None:
         self._templates[index] = RetrySpec(spec)
@@ -417,7 +438,17 @@ class Batch:
             return 0.0
         return max((job.finished_epoch for job in latest), default=0.0)
 
-    def snapshot(self, jobs: dict[str, Job], *, include_jobs: bool) -> dict[str, Any]:
+    def snapshot(
+        self,
+        jobs: dict[str, Job],
+        *,
+        include_jobs: bool,
+        compact_jobs: bool = False,
+        after_revision: int | None = None,
+    ) -> dict[str, Any]:
+        revision = self.revision
+        if after_revision is not None and after_revision == revision:
+            return {"id": self.id, "revision": revision, "unchanged": True}
         latest = self._latest_jobs(jobs)
         counts = {
             "queued": 0,
@@ -456,11 +487,12 @@ class Batch:
             "counts": counts,
             "active_count": active,
             "retryable_count": counts["failed"] + counts["cancelled"],
+            "revision": revision,
         }
         if include_jobs:
             items = []
             for job in latest:
-                item = job.snapshot()
+                item = job.compact_snapshot() if compact_jobs else job.snapshot()
                 item["attempt_count"] = len(self._attempts.get(job.batch_index) or ())
                 items.append(item)
             payload["jobs"] = items
@@ -486,15 +518,25 @@ class JobManager:
         self._submitted_batch_jobs: set[str] = set()
         self._shutting_down = False
         self._lock = threading.Lock()
+        self._next_cleanup_epoch = 0.0
 
     def _cleanup(self) -> None:
-        cutoff = time.time() - self.retention_seconds
+        monotonic_now = time.monotonic()
+        if monotonic_now < self._next_cleanup_epoch:
+            return
         with self._lock:
+            if monotonic_now < self._next_cleanup_epoch:
+                return
+            self._next_cleanup_epoch = monotonic_now + min(
+                60.0,
+                max(1.0, self.retention_seconds / 4),
+            )
+            cutoff = time.time() - self.retention_seconds
             expired_batches = [
                 batch_id
                 for batch_id, batch in self._batches.items()
-                if batch.finished_epoch(self._jobs)
-                and batch.finished_epoch(self._jobs) < cutoff
+                if (finished_epoch := batch.finished_epoch(self._jobs))
+                and finished_epoch < cutoff
             ]
             for batch_id in expired_batches:
                 batch = self._batches.pop(batch_id)
@@ -534,12 +576,14 @@ class JobManager:
         with self._lock:
             self._batches[batch.id] = batch
             for index, (label, spec) in enumerate(items, 1):
+                spec.proxy_offset = (index - 1) % len(spec.proxies)
                 job = Job(
                     spec,
                     diagnostic_dir=self.diagnostic_dir,
                     batch_id=batch.id,
                     batch_index=index,
                     label=label,
+                    on_change=batch.touch,
                 )
                 batch.add_item(index, label, spec, job.id)
                 self._jobs[job.id] = job
@@ -603,13 +647,24 @@ class JobManager:
             )[:bounded_limit]
             return [batch.snapshot(self._jobs, include_jobs=False) for batch in batches]
 
-    def batch_snapshot(self, batch_id: str) -> dict[str, Any] | None:
+    def batch_snapshot(
+        self,
+        batch_id: str,
+        *,
+        compact_jobs: bool = False,
+        after_revision: int | None = None,
+    ) -> dict[str, Any] | None:
         self._cleanup()
         with self._lock:
             batch = self._batches.get(batch_id)
             if batch is None:
                 return None
-            return batch.snapshot(self._jobs, include_jobs=True)
+            return batch.snapshot(
+                self._jobs,
+                include_jobs=True,
+                compact_jobs=compact_jobs,
+                after_revision=after_revision,
+            )
 
     def cancel_batch(self, batch_id: str) -> tuple[int, dict[str, Any]] | None:
         self._cleanup()
@@ -640,6 +695,7 @@ class JobManager:
             label=batch._labels.get(index, ""),
             attempt=len(attempts) + 1,
             retry_of=previous.id,
+            on_change=batch.touch,
         )
         batch.add_attempt(index, job.id)
         self._jobs[job.id] = job

@@ -66,6 +66,9 @@ POST /api/batches/<batch_id>/retry
 GET  /api/batches/<batch_id>/results.csv
 ```
 
+批次看板使用 `compact=1` 获取轻量任务字段，并通过 `after_revision=<revision>`
+跳过未变化的完整响应。默认并发为 8，最大并发为 20。
+
 ## 本地运行
 
 需要 Python 3.12+ 和 Node.js 22.19+。
