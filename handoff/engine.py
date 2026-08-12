@@ -47,6 +47,7 @@ class RunSpec:
     checkout_attempts: int = DEFAULT_CHECKOUT_ATTEMPTS
     provider_attempts: int = DEFAULT_PROVIDER_ATTEMPTS
     device_id: str = ""
+    proxy_offset: int = 0
 
     def clear_secrets(self) -> None:
         self.access_token = ""
@@ -216,7 +217,7 @@ class HandoffEngine:
             close_active_artifact()
             candidate_sequence += 1
             device_id = fixed_device_id or new_device_id()
-            checkout_proxy = spec.proxies.pick(candidate_sequence)
+            checkout_proxy = spec.proxies.pick(candidate_sequence + spec.proxy_offset)
             displayed_attempt = checkout_attempt + 1
             emit(
                 "info",
@@ -276,7 +277,9 @@ class HandoffEngine:
                 provider_proxy = (
                     checkout_proxy
                     if provider_attempt == 1
-                    else spec.proxies.pick(candidate_sequence + provider_attempt - 1)
+                    else spec.proxies.pick(
+                        candidate_sequence + provider_attempt - 1 + spec.proxy_offset
+                    )
                 )
                 emit(
                     "info",

@@ -116,6 +116,17 @@ class SlowGateway(SuccessGateway):
                 self.active -= 1
 
 
+class ProxyDistributionGateway(SuccessGateway):
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.proxy_by_token = {}
+
+    def create_checkout(self, **kwargs):
+        with self._lock:
+            self.proxy_by_token[kwargs["access_token"]] = kwargs["proxy"].host
+        return super().create_checkout(**kwargs)
+
+
 def payload(token):
     return {
         "access_token": token,
@@ -153,6 +164,7 @@ def test_meta_and_frontend_only_expose_link_extraction():
     assert meta["defaults"]["provider_attempts"] == 10
     assert meta["defaults"]["country"] == "BR"
     assert meta["defaults"]["checkout_country"] == "DE"
+    assert meta["defaults"]["batch_concurrency"] == 8
     brazil = next(item for item in meta["countries"] if item["code"] == "BR")
     assert brazil["checkout_country"] == "DE"
     assert brazil["checkout_currency"] == "EUR"
@@ -264,6 +276,77 @@ def test_batch_concurrency_limit_is_enforced():
     assert gateway.max_active == 2
     request["concurrency"] = 21
     assert client.post("/api/batches", json=request).status_code == 400
+    app.extensions["job_manager"].shutdown()
+
+
+def test_batch_distributes_first_checkout_across_proxy_pool():
+    tokens = [make_token(email=f"proxy{index}@example.com") for index in range(6)]
+    gateway = ProxyDistributionGateway()
+    app = create_app({"TESTING": True, "JOB_WORKERS": 6}, gateway=gateway)
+    client = app.test_client()
+    request = payload(tokens[0])
+    request.pop("access_token")
+    request.update(
+        {
+            "access_tokens": tokens,
+            "concurrency": 6,
+            "proxies": "a.example:1001\nb.example:1002\nc.example:1003",
+        }
+    )
+
+    batch_id = client.post("/api/batches", json=request).get_json()["id"]
+    wait_for_batch(client, batch_id)
+
+    assert [gateway.proxy_by_token[token] for token in tokens] == [
+        "a.example",
+        "b.example",
+        "c.example",
+        "a.example",
+        "b.example",
+        "c.example",
+    ]
+    app.extensions["job_manager"].shutdown()
+
+
+def test_compact_batch_snapshot_and_unchanged_revision_response():
+    tokens = [make_token(email=f"compact{index}@example.com") for index in range(4)]
+    app = create_app({"TESTING": True, "JOB_WORKERS": 4}, gateway=SuccessGateway())
+    client = app.test_client()
+    request = payload(tokens[0])
+    request.pop("access_token")
+    request.update({"access_tokens": tokens, "concurrency": 4})
+    batch_id = client.post("/api/batches", json=request).get_json()["id"]
+    wait_for_batch(client, batch_id)
+
+    compact_response = client.get(f"/api/batches/{batch_id}?compact=1")
+    compact = compact_response.get_json()
+    assert compact["status"] == "success"
+    assert compact["revision"] > 0
+    assert len(compact["jobs"]) == 4
+    assert set(compact["jobs"][0]) == {
+        "attempt",
+        "attempt_count",
+        "batch_index",
+        "failure_reason",
+        "id",
+        "label",
+        "result_url",
+        "status",
+    }
+    assert compact["jobs"][0]["result_url"].endswith("BA-SUCCESS")
+
+    unchanged_response = client.get(
+        f"/api/batches/{batch_id}?compact=1&after_revision={compact['revision']}"
+    )
+    assert unchanged_response.get_json() == {
+        "id": batch_id,
+        "revision": compact["revision"],
+        "unchanged": True,
+    }
+    assert len(unchanged_response.data) < 120
+    assert client.get(
+        f"/api/batches/{batch_id}?after_revision=invalid"
+    ).status_code == 400
     app.extensions["job_manager"].shutdown()
 
 

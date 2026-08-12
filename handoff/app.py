@@ -23,7 +23,7 @@ from .security import normalize_access_token, token_profile
 
 
 DEFAULT_MAX_BATCH_ITEMS = 200
-DEFAULT_BATCH_CONCURRENCY = 3
+DEFAULT_BATCH_CONCURRENCY = 8
 MAX_BATCH_CONCURRENCY = 20
 
 
@@ -251,7 +251,19 @@ def create_app(config: dict | None = None, *, gateway=None) -> Flask:
 
     @app.get("/api/batches/<batch_id>")
     def batch_status(batch_id: str):
-        snapshot = manager.batch_snapshot(batch_id)
+        compact = request.args.get("compact") in {"1", "true", "yes"}
+        raw_revision = request.args.get("after_revision")
+        try:
+            after_revision = (
+                max(0, int(raw_revision)) if raw_revision not in {None, ""} else None
+            )
+        except ValueError:
+            return jsonify({"error": "after_revision 必须是整数"}), 400
+        snapshot = manager.batch_snapshot(
+            batch_id,
+            compact_jobs=compact,
+            after_revision=after_revision,
+        )
         if snapshot is None:
             return jsonify({"error": "批次不存在或结果已过期"}), 404
         return jsonify(snapshot)
