@@ -639,10 +639,10 @@ def _warmup_chatgpt_page(
 ) -> None:
     """Warm the real page in the same session so cookies and context stay aligned."""
     # Checkout creation and account preflight share a session.  Avoid a
-    # second document request in the same session, while a renewed session
-    # naturally gets a fresh warmup.
+    # duplicate request for the same page, while still warming a later
+    # checkout-specific page in the approval flow.
     try:
-        if getattr(http, "_oaics_page_warmed", False):
+        if getattr(http, "_oaics_warmed_page_url", "") == page_url:
             return
     except Exception:
         pass
@@ -685,8 +685,7 @@ def _warmup_chatgpt_page(
         if status >= 400:
             log(f"[context] 页面预热返回 HTTP {status}（继续）")
         else:
-            try:
-                setattr(http, "_oaics_page_warmed", True)
+                setattr(http, "_oaics_warmed_page_url", page_url)
             except Exception:
                 pass
             log("[context] 页面与 Cookie 上下文已对齐")
