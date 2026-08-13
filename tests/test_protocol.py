@@ -14,6 +14,112 @@ from handoff.gateway import (
 )
 from handoff.proxies import parse_proxy_lines
 from handoff.protocol import stripe_checkout as stripe
+from handoff.gateway import preflight_checkout_route
+
+
+def test_verify_chatgpt_account_classifies_cloudflare_challenge_and_logs_trace():
+    logs = []
+
+    class Response:
+        status_code = 403
+        text = "Just a moment... enable JavaScript and cookies to continue"
+        headers = {
+            "CF-Ray": "fixture-ray",
+            "CF-Mitigated": "challenge",
+            "Content-Type": "text/html",
+        }
+
+    class Http:
+        cookies = {}
+
+        def get(self, url, **kwargs):
+            if url.endswith("/"):
+                return SimpleNamespace(status_code=200, text="", headers={})
+            assert url.endswith("/backend-api/me")
+            assert kwargs["headers"]["Authorization"] == "Bearer test-at"
+            return Response()
+
+    with pytest.raises(stripe.CheckoutPreflightError) as captured:
+        stripe.verify_chatgpt_account(
+            Http(),
+            "test-at",
+            country="BR",
+            device_id="device-test",
+            log=logs.append,
+        )
+
+    assert captured.value.code == "CLOUDFLARE_CHALLENGE"
+    assert "Cloudflare Challenge" in str(captured.value)
+    diagnostic = json.loads(
+        next(
+            item
+            for item in logs
+            if item.startswith("[protocol-diagnostic] ") and '"kind":"chatgpt_me"' in item
+        ).removeprefix("[protocol-diagnostic] ")
+    )
+    assert diagnostic["http_status"] == 403
+    assert diagnostic["response"]["challenge"] is True
+    assert diagnostic["response_headers"]["cf-ray"] == "fixture-ray"
+    assert diagnostic["response_headers"]["cf-mitigated"] == "challenge"
+    assert "test-at" not in repr(logs)
+
+
+def test_verify_chatgpt_account_wraps_connection_failure_and_logs_error():
+    logs = []
+
+    class Http:
+        cookies = {}
+
+        def get(self, *_args, **_kwargs):
+            raise ConnectionError("curl: (56) connection closed abruptly")
+
+    with pytest.raises(stripe.CheckoutPreflightError) as captured:
+        stripe.verify_chatgpt_account(
+            Http(),
+            "test-at",
+            country="BR",
+            device_id="device-test",
+            log=logs.append,
+        )
+
+    assert captured.value.code == "CHATGPT_CONNECTION_FAILED"
+    assert "curl: (56)" in str(captured.value)
+    assert any("chatgpt_me" in item and "connection closed abruptly" in item for item in logs)
+
+
+def test_preflight_retries_transient_failure_without_consuming_checkout(monkeypatch):
+    calls = []
+    renewals = []
+    sleeps = []
+
+    def exit_check(_http, _country):
+        calls.append("exit")
+        return {"ip": "203.0.113.10", "country": "BR", "source": "test"}
+
+    def account_check(_http, _token, **_kwargs):
+        calls.append("me")
+        if calls.count("me") == 1:
+            raise stripe.CheckoutPreflightError(
+                "ChatGPT /me 连接失败: ConnectionError: curl: (56)",
+                code="CHATGPT_CONNECTION_FAILED",
+            )
+
+    monkeypatch.setattr(stripe, "verify_proxy_exit_country", exit_check)
+    monkeypatch.setattr(stripe, "verify_chatgpt_account", account_check)
+    monkeypatch.setattr(stripe.time, "sleep", sleeps.append)
+
+    preflight_checkout_route(
+        http=object(),
+        proxy_country="BR",
+        access_token="test-at",
+        device_id="device-test",
+        log=lambda _message: None,
+        renew_http=lambda current: renewals.append(current) or object(),
+    )
+
+    assert calls == ["exit", "me", "exit", "me"]
+    assert len(renewals) == 1
+    assert sleeps == [stripe.PREFLIGHT_RETRY_DELAY_SECONDS]
 
 
 def test_checkout_response_prefers_oaics_and_sends_country_promo_contract(monkeypatch):

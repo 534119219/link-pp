@@ -40,6 +40,15 @@ CHECKOUT_SESSION_ATTEMPTS_DEFAULT = 3
 CHECKOUT_SESSION_ATTEMPTS_MIN = 1
 ZERO_AMOUNT_VERIFY_ATTEMPTS = 4
 ZERO_AMOUNT_VERIFY_DELAY_SECONDS = 0.8
+# Keep the account preflight bounded.  A fresh session is useful for a broken
+# proxy connection, but retrying indefinitely only amplifies upstream rate
+# limits and Cloudflare challenges.
+PREFLIGHT_RETRY_ATTEMPTS = 2
+PREFLIGHT_RETRY_DELAY_SECONDS = 0.25
+# Batch workers may be higher for throughput, but the account/page preflight
+# should be gently paced to avoid a burst of identical edge requests.
+PREFLIGHT_CONCURRENCY = 3
+_PREFLIGHT_SEMAPHORE = threading.BoundedSemaphore(PREFLIGHT_CONCURRENCY)
 
 OPENAI_IE_COUNTRIES = {
     "AT", "BE", "BG", "CH", "CY", "CZ", "DE", "DK", "EE", "ES", "FI",
@@ -313,10 +322,14 @@ def proxy_exit_log_label(info: dict[str, str]) -> str:
 
 
 def _is_cloudflare_challenge(response: Any) -> bool:
-    headers = getattr(response, "headers", {}) or {}
+    raw_headers = getattr(response, "headers", {}) or {}
+    try:
+        headers = {str(key).lower(): str(value) for key, value in raw_headers.items()}
+    except Exception:
+        headers = {}
     text = (getattr(response, "text", "") or "")[:4000].lower()
     return (
-        str(headers.get("cf-mitigated") or "").lower() == "challenge"
+        headers.get("cf-mitigated") == "challenge"
         or "enable javascript and cookies to continue" in text
         or "cf-chl-" in text
         or "just a moment" in text
@@ -329,8 +342,16 @@ def verify_chatgpt_account(
     *,
     country: str,
     device_id: str,
+    log: Callable[[str], None] = lambda _message: None,
 ) -> None:
     _set_oai_device_cookie(http, device_id)
+    _warmup_chatgpt_page(
+        http,
+        page_url="https://chatgpt.com/",
+        country=country,
+        device_id=device_id,
+        log=log,
+    )
     path = "/backend-api/me"
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -346,15 +367,46 @@ def verify_chatgpt_account(
     try:
         response = http.get("https://chatgpt.com/backend-api/me", headers=headers, timeout=30)
     except Exception as exc:
+        _protocol_diagnostic(
+            log,
+            kind="chatgpt_me",
+            method="GET",
+            route=path,
+            request_payload={
+                "country": str(country or "").upper(),
+                "device_id_present": bool(device_id),
+            },
+            error=f"{type(exc).__name__}: {exc}",
+        )
         raise CheckoutPreflightError(
             f"ChatGPT /me 连接失败: {type(exc).__name__}: {exc}",
             code="CHATGPT_CONNECTION_FAILED",
         ) from exc
     status = int(getattr(response, "status_code", 0) or 0)
     text = getattr(response, "text", "") or ""
+    challenge = _is_cloudflare_challenge(response)
+    _protocol_diagnostic(
+        log,
+        kind="chatgpt_me",
+        method="GET",
+        route=path,
+        status=status,
+        request_payload={
+            "country": str(country or "").upper(),
+            "device_id_present": bool(device_id),
+        },
+        response_payload={
+            "challenge": challenge,
+            "content_type": str(
+                (getattr(response, "headers", {}) or {}).get("content-type") or ""
+            )[:160],
+            "body_prefix": text[:240] if challenge else "",
+        },
+        response=response,
+    )
     if status == 401:
         raise ChatGPTAuthError("Access Token 鉴权失败: ChatGPT /me HTTP 401")
-    if _is_cloudflare_challenge(response):
+    if challenge:
         raise CheckoutPreflightError(
             "ChatGPT /me HTTP 403: Cloudflare Challenge",
             code="CLOUDFLARE_CHALLENGE",
@@ -586,6 +638,14 @@ def _warmup_chatgpt_page(
     log: Callable[[str], None],
 ) -> None:
     """Warm the real page in the same session so cookies and context stay aligned."""
+    # Checkout creation and account preflight share a session.  Avoid a
+    # second document request in the same session, while a renewed session
+    # naturally gets a fresh warmup.
+    try:
+        if getattr(http, "_oaics_page_warmed", False):
+            return
+    except Exception:
+        pass
     try:
         response = http.get(
             page_url,
@@ -604,11 +664,44 @@ def _warmup_chatgpt_page(
             timeout=30,
         )
         status = int(getattr(response, "status_code", 0) or 0)
+        _protocol_diagnostic(
+            log,
+            kind="chatgpt_page_warmup",
+            method="GET",
+            route="/",
+            status=status,
+            request_payload={
+                "country": str(country or "").upper(),
+                "device_id_present": bool(device_id),
+            },
+            response_payload={
+                "challenge": _is_cloudflare_challenge(response),
+                "content_type": str(
+                    (getattr(response, "headers", {}) or {}).get("content-type") or ""
+                )[:160],
+            },
+            response=response,
+        )
         if status >= 400:
             log(f"[context] 页面预热返回 HTTP {status}（继续）")
         else:
+            try:
+                setattr(http, "_oaics_page_warmed", True)
+            except Exception:
+                pass
             log("[context] 页面与 Cookie 上下文已对齐")
     except Exception as exc:
+        _protocol_diagnostic(
+            log,
+            kind="chatgpt_page_warmup",
+            method="GET",
+            route="/",
+            request_payload={
+                "country": str(country or "").upper(),
+                "device_id_present": bool(device_id),
+            },
+            error=f"{type(exc).__name__}: {exc}",
+        )
         log(f"[context] 页面预热失败（继续）: {type(exc).__name__}: {exc}")
 
 
@@ -651,9 +744,9 @@ def renew_http_session(http, proxy: Optional[str]):
 
 
 def _diagnostic_headers(headers: Any) -> dict[str, str]:
-    if not isinstance(headers, dict):
-        return {}
     allowed = {
+        "cf-cache-status",
+        "cf-mitigated",
         "cf-ray",
         "content-type",
         "openai-processing-ms",
@@ -664,9 +757,13 @@ def _diagnostic_headers(headers: Any) -> dict[str, str]:
         "x-openai-request-id",
         "x-request-id",
     }
+    try:
+        items = headers.items()
+    except Exception:
+        return {}
     return {
         str(key).lower(): str(value)[:500]
-        for key, value in headers.items()
+        for key, value in items
         if str(key).lower() in allowed
     }
 

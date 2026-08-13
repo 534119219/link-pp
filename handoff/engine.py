@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass
 from typing import Callable, Protocol
 
@@ -148,7 +149,7 @@ def _short_reason(exc: BaseException, access_token: str) -> str:
         return "未取得 PayPal 跳转地址"
     if "bad_decrypt" in lower:
         return "代理 TLS 解密异常（BAD_DECRYPT）"
-    if "connection closed abruptly" in lower:
+    if "connection closed abruptly" in lower or re.search(r"curl\s*:\s*\(56\)", lower):
         return "代理连接被上游中断（curl 56）"
     network_markers = (
         "timeout",
@@ -313,10 +314,16 @@ class HandoffEngine:
                     raise
                 except Exception as exc:
                     last_error = exc
-                    if _short_reason(exc, token) != "代理连接失败" and not any(
-                        marker in str(exc).lower()
-                        for marker in ("bad_decrypt", "connection closed abruptly")
-                    ):
+                    raw_error = str(exc).lower()
+                    is_transport_noise = (
+                        _short_reason(exc, token) in {"代理连接失败", "代理连接被上游中断（curl 56）"}
+                        or any(
+                            marker in raw_error
+                            for marker in ("bad_decrypt", "connection closed abruptly")
+                        )
+                        or bool(re.search(r"curl\s*:\s*\(56\)", raw_error))
+                    )
+                    if not is_transport_noise:
                         last_provider_error = exc
                     reason = _short_reason(exc, token)
                     if _is_auth_error(exc):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import re
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -76,16 +77,50 @@ def preflight_checkout_route(
     access_token: str,
     device_id: str,
     log: LogFn,
+    renew_http: Callable[[Any], Any] | None = None,
 ) -> None:
-    checkout_info = stripe.verify_proxy_exit_country(http, proxy_country)
-    log(f"Checkout 出口预检通过：{stripe.proxy_exit_log_label(checkout_info)}")
-    stripe.verify_chatgpt_account(
-        http,
-        access_token,
-        country=proxy_country,
-        device_id=device_id,
-    )
-    log("ChatGPT /me 账号与连接预检通过")
+    retryable_codes = {
+        "CLOUDFLARE_CHALLENGE",
+        "CHATGPT_CONNECTION_FAILED",
+        "PROXY_UNAVAILABLE",
+    }
+    last_error: stripe.CheckoutPreflightError | None = None
+    with stripe._PREFLIGHT_SEMAPHORE:
+        for attempt in range(1, stripe.PREFLIGHT_RETRY_ATTEMPTS + 1):
+            try:
+                checkout_info = stripe.verify_proxy_exit_country(http, proxy_country)
+                log(f"Checkout 出口预检通过：{stripe.proxy_exit_log_label(checkout_info)}")
+                # verify_chatgpt_account warms the page in this same session
+                # before making the protected /me request.
+                stripe.verify_chatgpt_account(
+                    http,
+                    access_token,
+                    country=proxy_country,
+                    device_id=device_id,
+                    log=log,
+                )
+                log("ChatGPT /me 账号与连接预检通过")
+                return
+            except stripe.CheckoutPreflightError as exc:
+                last_error = exc
+                if attempt >= stripe.PREFLIGHT_RETRY_ATTEMPTS or exc.code not in retryable_codes:
+                    raise
+                log(
+                    f"预检瞬时失败（{exc.code}），同代理重试 "
+                    f"{attempt + 1}/{stripe.PREFLIGHT_RETRY_ATTEMPTS}"
+                )
+                # A curl 56/connection failure leaves the pool unusable.  A new
+                # session also gives a challenged route a clean TLS connection;
+                # cookies are copied by renew_http_session.
+                if renew_http is not None:
+                    try:
+                        http = renew_http(http)
+                        log("预检已重建同代理 HTTP 会话")
+                    except Exception as renew_exc:
+                        log(f"预检会话重建失败（继续重试）: {type(renew_exc).__name__}: {renew_exc}")
+                time.sleep(stripe.PREFLIGHT_RETRY_DELAY_SECONDS)
+    if last_error is not None:
+        raise last_error
 
 
 def _ba_from_url(url: str) -> str:
@@ -193,6 +228,7 @@ class LiveProtocolGateway:
                 access_token=access_token,
                 device_id=device_id,
                 log=log,
+                renew_http=renew_checkout_http,
             )
             session_id, error = stripe.create_chatgpt_order_with_retry(
                 http,
@@ -295,18 +331,23 @@ class LiveProtocolGateway:
         reused_checkout_transport = http is not None
         if http is None:
             http = stripe.build_http(proxy.url)
+
+        def renew_provider_http(current):
+            nonlocal http
+            http = stripe.renew_http_session(current, proxy.url)
+            return http
+
         try:
             check_cancelled()
             if not reused_checkout_transport:
-                info = stripe.verify_proxy_exit_country(http, proxy_country.code)
-                log(f"提链出口预检通过：{stripe.proxy_exit_log_label(info)}")
-                stripe.verify_chatgpt_account(
-                    http,
-                    access_token,
-                    country=proxy_country.code,
+                preflight_checkout_route(
+                    http=http,
+                    proxy_country=proxy_country.code,
+                    access_token=access_token,
                     device_id=device_id,
+                    log=log,
+                    renew_http=renew_provider_http,
                 )
-                log("提链出口 ChatGPT /me 预检通过")
             else:
                 log("首次提链复用 Checkout 会话")
             redirect_url, _context = stripe.oaics_to_paypal_redirect(
