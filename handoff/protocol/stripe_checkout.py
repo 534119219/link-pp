@@ -685,6 +685,7 @@ def _warmup_chatgpt_page(
         if status >= 400:
             log(f"[context] 页面预热返回 HTTP {status}（继续）")
         else:
+            try:
                 setattr(http, "_oaics_warmed_page_url", page_url)
             except Exception:
                 pass
