@@ -216,6 +216,7 @@ def test_attempt_validation_and_short_reasons():
     with pytest.raises(ValueError):
         positive_attempts(0, default=1)
     assert _short_reason(TimeoutError("read timed out"), "") == "代理连接失败"
+    assert _short_reason(RuntimeError("curl: (56) connection closed abruptly"), "") == "代理连接被上游中断（curl 56）"
     assert (
         _short_reason(
             RuntimeError("curl: (56) OPENSSL_internal:BAD_DECRYPT"),

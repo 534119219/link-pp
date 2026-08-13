@@ -30,6 +30,12 @@ HTTP 会话。代理预检失败不会消耗 Checkout 次数。当 `approve bloc
 OAICS confirm 持续 blocked、未返回 PayPal 方法或 Checkout 失效时，当前订单会
 立即停止并创建新单；其他短暂异常会在同一 Checkout 内更换代理重试。
 
+预检会先在同一 HTTP 会话预热 ChatGPT 页面/Cookie，再请求 `/backend-api/me`。
+Cloudflare Challenge、代理出口查询失败和连接中断最多在同一代理上重试一次，
+连接异常会重建会话并保留 Cookie；预检并发限制为 3 路，避免批量任务瞬时打满
+ChatGPT 边缘节点。相关状态码、`cf-ray`/`cf-mitigated` 等诊断字段只写入后端
+脱敏日志，不会消耗 Checkout 次数。
+
 ## 输入
 
 - 单个 AT 或批量 AT
