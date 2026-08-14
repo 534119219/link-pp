@@ -21,21 +21,44 @@ PayPal Billing Agreement 链接。项目只负责提链，不注册 PayPal 用�
   -> 返回链接并停止
 ```
 
-默认执行上述 `oaics_` 流程。勾选“Stripe 链提炼”后改为严格的
-`cs_live_` Hosted Checkout 流程：前置优惠随首次 Checkout 请求提交，
-核验 Stripe `init` 应付金额为 0，然后执行
-`init -> elements -> confirm -> approve/re-confirm -> PayPal BA`。Stripe 模式可选择
-Python 或 Go 引擎，默认仍为 Python；Go 只处理 `cs_live_`/`cs_test_` Stripe Session，
-OAICS 继续由 Python 处理。两种模式和两个引擎都不会自动互相回退。
+默认执行上述 `oaics_` 流程。OAICS 始终在创建 Checkout 时携带
+`plus-1-month-free`，不受 Stripe 优惠策略影响。
+
+勾选“Stripe 链提炼”后改为严格的 `cs_live_` Hosted Checkout 流程。
+Stripe 模式可选择 Python 或 Go 引擎，默认为 Python；Go 只处理
+`cs_live_`/`cs_test_` Stripe Session，OAICS 继续由 Python 处理。两种模式和
+两个引擎都不会自动互相回退。
+
+Stripe 优惠策略：
+
+- `upfront`（前置优惠）：创建 Checkout 时直接携带优惠；若 Stripe `init`
+  仍不是 0 元，当前 Checkout 失败，不自动转后置 update。
+- `post_update`（后置 update 优惠，默认）：先创建无优惠 Checkout，通过
+  Stripe `init`/Elements 确认开放 PayPal，再调用
+  `/backend-api/payments/checkout/update` 施加优惠并重新 `init` 至 0 元。
+- `mixed`（混合优惠）：Checkout 第 1/3/5... 轮使用前置，第 2/4/6...
+  轮使用后置 update。
+
+Python 和 Go 的 Stripe 共同主链为：
+
+```text
+init -> Elements/PayPal 检测 -> 可选 update + 重新 init -> 严格 0 元校验
+     -> tax region -> ChatGPT billing snapshot -> 创建 PayPal pm_*
+     -> 单次 compact confirm -> 可选 manual approve -> 轮询 redirect -> PayPal BA
+```
+
+`approve` 后只轮询原 submission，不再发起第二次 confirm。Stripe 返回
+`generic_decline` 等 PayPal setup 终态时会立即归类为拒绝，不会误报为
+“未返回 redirect”。
 
 只有 Checkout 实际返回 `cpmt_` 自定义支付方式时才使用
 `custom_payment_method/start` 兼容分支；空的 `custom_payment_methods` 不代表未开放
 PayPal，是否开放以 `payment_method_types` 为准。
 
-整条链路不调用 `/backend-api/payments/checkout/update`，并复用创建 Checkout 的
-HTTP 会话。代理预检失败不会消耗 Checkout 次数。当 `approve blocked`、
-OAICS confirm 持续 blocked、未返回 PayPal 方法或 Checkout 失效时，当前订单会
-立即停止并创建新单；其他短暂异常会在同一 Checkout 内更换代理重试。
+创建 Checkout 与首次提链复用同一 HTTP 会话。代理预检失败不会消耗
+Checkout 次数。当 `approve blocked`、PayPal setup decline、OAICS confirm 持续
+blocked、明确未返回 PayPal 方法或 Checkout 失效时，当前订单会立即停止并
+创建新单；其他短暂异常会在同一 Checkout 内更换代理重试。
 
 预检会先在同一 HTTP 会话预热 ChatGPT 页面/Cookie，再请求 `/backend-api/me`。
 Cloudflare Challenge、代理出口查询失败和连接中断不在同一代理上重试：预检请求
@@ -50,6 +73,7 @@ Cloudflare Challenge、代理出口查询失败和连接中断不在同一代理
 - 独立账单国家（默认巴西出口使用德国 DE/EUR，也可手动选择巴西 BR/USD 等国家）
 - OAICS 或 Stripe Hosted 提链模式
 - Stripe Hosted 的 Python/Go 执行引擎
+- Stripe Hosted 的前置、后置 update 或混合优惠策略
 - Checkout 次数与每轮提链次数
 - 批量并发数
 
@@ -90,6 +114,19 @@ GET  /api/batches/<batch_id>/results.csv
 `billing_country` 改为 `BR` 即使用巴西出口和巴西账单。未传 `billing_country`
 时继续使用原有自动映射。
 
+Stripe 任务另外传入 `stripe_checkout=true`，`stripe_engine` 支持 `python` 或
+`go`，`stripe_promo_strategy` 支持 `upfront`、`post_update` 或 `mixed`。例如：
+
+```json
+{
+  "country": "BR",
+  "billing_country": "DE",
+  "stripe_checkout": true,
+  "stripe_engine": "go",
+  "stripe_promo_strategy": "mixed"
+}
+```
+
 批次看板使用 `compact=1` 获取轻量任务字段，并通过 `after_revision=<revision>`
 跳过未变化的完整响应。默认并发为 8，最大并发为 20。
 
@@ -118,8 +155,9 @@ docker compose logs -f
 
 前台仅显示关键里程碑和警告。每个任务的完整脱敏日志保存在 Docker 持久卷的
 `/data/diagnostics/<job_id>.jsonl`，容器重建后仍保留。结构化协议记录覆盖
-`checkout_create`、`checkout_state`、`checkout_taxes`、`stripe_elements_session`、
-`stripe_confirmation_token`、`checkout_confirm`、`stripe_intent_confirm` 和兼容分支的
+`checkout_create`、`checkout_state`、`checkout_taxes`、`checkout_promo_update`、
+`stripe_elements_session`、`stripe_confirmation_token`、`checkout_confirm`、
+`stripe_intent_confirm` 和兼容分支的
 `custom_payment_start`，PayPal 跳转另记录 `paypal_redirect`。记录包含 HTTP 状态、脱敏
 请求/响应及上游 trace headers；不会记录 AT、Cookie、Sentinel、代理凭证或完整账单
 个人信息。
