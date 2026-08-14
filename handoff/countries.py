@@ -93,6 +93,7 @@ _COUNTRIES = (
     _profile("SG", "新加坡", "SGD", "en-SG", "Asia/Singapore", BillingAddress("1 Raffles Place", "Singapore", "048616")),
     _profile("MY", "马来西亚", "MYR", "ms-MY", "Asia/Kuala_Lumpur", BillingAddress("1 Jalan Ampang", "Kuala Lumpur", "50450", "Kuala Lumpur")),
     _profile("TH", "泰国", "THB", "th-TH", "Asia/Bangkok", BillingAddress("1 Ratchadamri Road", "Bangkok", "10330", "Bangkok")),
+    _profile("VN", "越南", "VND", "vi-VN", "Asia/Ho_Chi_Minh", BillingAddress("1 Le Loi", "Ho Chi Minh City", "700000", "Ho Chi Minh")),
     _profile("PH", "菲律宾", "PHP", "en-PH", "Asia/Manila", BillingAddress("1 Ayala Avenue", "Makati", "1226", "Metro Manila")),
     _profile("ID", "印度尼西亚", "IDR", "id-ID", "Asia/Jakarta", BillingAddress("1 Jalan Sudirman", "Jakarta", "10220", "DKI Jakarta")),
     _profile("IN", "印度", "INR", "en-IN", "Asia/Kolkata", BillingAddress("1 Connaught Place", "New Delhi", "110001", "Delhi")),

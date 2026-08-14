@@ -41,6 +41,17 @@ def test_thailand_paypal_profile_is_complete():
     assert thailand.timezone == "Asia/Bangkok"
 
 
+def test_vietnam_profile_uses_vnd_and_follows_selected_country():
+    vietnam = get_country("vn")
+    assert vietnam.name == "越南"
+    assert vietnam.currency == "VND"
+    assert vietnam.locale == "vi-VN"
+    assert vietnam.timezone == "Asia/Ho_Chi_Minh"
+    assert vietnam.processor_entity == "openai_llc"
+    assert checkout_country_for_proxy(vietnam) is vietnam
+    assert vietnam.billing_dict(name="Owner", email="owner@example.com")["address"]["country"] == "VN"
+
+
 def test_brazil_proxy_uses_german_checkout_profile():
     checkout = checkout_country_for_proxy(get_country("BR"))
     assert checkout.code == "DE"

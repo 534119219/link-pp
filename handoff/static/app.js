@@ -258,8 +258,8 @@
   document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () => switchTab(t.dataset.tab)));
 
   // ─── Country Picker ────────────────────────────────────────────────
-  const REGIONS = { "美洲": ["US","CA","BR","MX","AR","CL","CO","PE"], "欧洲": ["GB","DE","FR","ES","IT","NL","BE","IE","PT","AT","CH","SE","NO","DK","FI","PL","CZ","RO","HU","GR"], "亚太": ["JP","KR","SG","MY","TH","PH","ID","IN","TW","HK","AU","NZ"], "中东/非洲": ["IL","AE","ZA"] };
-  const COUNTRY_FLAGS = {US:"🇺🇸",BR:"🇧🇷",GB:"🇬🇧",FR:"🇫🇷",DE:"🇩🇪",JP:"🇯🇵",CA:"🇨🇦",AU:"🇦🇺",NZ:"🇳🇿",MX:"🇲🇽",AR:"🇦🇷",CL:"🇨🇱",CO:"🇨🇴",PE:"🇵🇪",ES:"🇪🇸",IT:"🇮🇹",NL:"🇳🇱",BE:"🇧🇪",IE:"🇮🇪",PT:"🇵🇹",AT:"🇦🇹",CH:"🇨🇭",SE:"🇸🇪",NO:"🇳🇴",DK:"🇩🇰",FI:"🇫🇮",PL:"🇵🇱",CZ:"🇨🇿",RO:"🇷🇴",HU:"🇭🇺",GR:"🇬🇷",SG:"🇸🇬",MY:"🇲🇾",TH:"🇹🇭",PH:"🇵🇭",ID:"🇮🇩",IN:"🇮🇳",KR:"🇰🇷",TW:"🇹🇼",HK:"🇭🇰",IL:"🇮🇱",AE:"🇦🇪",ZA:"🇿🇦"};
+  const REGIONS = { "美洲": ["US","CA","BR","MX","AR","CL","CO","PE"], "欧洲": ["GB","DE","FR","ES","IT","NL","BE","IE","PT","AT","CH","SE","NO","DK","FI","PL","CZ","RO","HU","GR"], "亚太": ["JP","KR","SG","MY","TH","VN","PH","ID","IN","TW","HK","AU","NZ"], "中东/非洲": ["IL","AE","ZA"] };
+  const COUNTRY_FLAGS = {US:"🇺🇸",BR:"🇧🇷",GB:"🇬🇧",FR:"🇫🇷",DE:"🇩🇪",JP:"🇯🇵",CA:"🇨🇦",AU:"🇦🇺",NZ:"🇳🇿",MX:"🇲🇽",AR:"🇦🇷",CL:"🇨🇱",CO:"🇨🇴",PE:"🇵🇪",ES:"🇪🇸",IT:"🇮🇹",NL:"🇳🇱",BE:"🇧🇪",IE:"🇮🇪",PT:"🇵🇹",AT:"🇦🇹",CH:"🇨🇭",SE:"🇸🇪",NO:"🇳🇴",DK:"🇩🇰",FI:"🇫🇮",PL:"🇵🇱",CZ:"🇨🇿",RO:"🇷🇴",HU:"🇭🇺",GR:"🇬🇷",SG:"🇸🇬",MY:"🇲🇾",TH:"🇹🇭",VN:"🇻🇳",PH:"🇵🇭",ID:"🇮🇩",IN:"🇮🇳",KR:"🇰🇷",TW:"🇹🇼",HK:"🇭🇰",IL:"🇮🇱",AE:"🇦🇪",ZA:"🇿🇦"};
 
   function setupCountryPicker(pickerBtnId, labelId, codeInputId, dropdownId, searchId, listId, detailId, detailTextId, onChange = null) {
     const btn = $(pickerBtnId);

@@ -180,6 +180,10 @@ def test_meta_and_frontend_only_expose_link_extraction():
     brazil = next(item for item in meta["countries"] if item["code"] == "BR")
     assert brazil["checkout_country"] == "DE"
     assert brazil["checkout_currency"] == "EUR"
+    vietnam = next(item for item in meta["countries"] if item["code"] == "VN")
+    assert vietnam["currency"] == "VND"
+    assert vietnam["checkout_country"] == "VN"
+    assert vietnam["checkout_currency"] == "VND"
     assert "link_types" not in meta
     html = client.get("/").get_data(as_text=True)
     assert "PayPal 提链" in html
