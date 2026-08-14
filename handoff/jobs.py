@@ -32,6 +32,10 @@ _UI_INFO_MARKERS = (
     "重建同代理 HTTP 会话",
     "临时限流",
     "等待 Stripe 最终状态",
+    "Stripe 提链引擎",
+    "开始 Go Stripe",
+    "开始 Python Stripe",
+    "Stripe 出口预检",
 )
 
 
@@ -56,6 +60,9 @@ def _clone_spec(spec: RunSpec) -> RunSpec:
         proxies=spec.proxies,
         checkout_attempts=spec.checkout_attempts,
         provider_attempts=spec.provider_attempts,
+        stripe_checkout=spec.stripe_checkout,
+        stripe_engine=spec.stripe_engine,
+        stripe_promo_strategy=spec.stripe_promo_strategy,
         device_id=spec.device_id,
         proxy_offset=spec.proxy_offset,
     )
@@ -124,10 +131,14 @@ class Job:
         self._config = {
             "country": spec.proxy_country.code,
             "proxy_country": spec.proxy_country.code,
+            "billing_country": spec.checkout_country.code,
             "checkout_country": spec.checkout_country.code,
             "checkout_currency": spec.checkout_country.currency,
             "checkout_attempts": spec.checkout_attempts,
             "provider_attempts": spec.provider_attempts,
+            "stripe_checkout": spec.stripe_checkout,
+            "stripe_engine": spec.stripe_engine,
+            "stripe_promo_strategy": spec.stripe_promo_strategy,
             "proxy_count": len(spec.proxies),
         }
         self._cancel = threading.Event()

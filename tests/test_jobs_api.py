@@ -11,7 +11,13 @@ from handoff.jobs import Job
 
 
 class SuccessGateway:
+    def __init__(self):
+        self.checkout_calls = []
+
     def create_checkout(self, **kwargs):
+        if not hasattr(self, "checkout_calls"):
+            self.checkout_calls = []
+        self.checkout_calls.append(kwargs)
         return CheckoutArtifact(
             session_id="oaics_success",
             processor_entity=kwargs["checkout_country"].processor_entity,
@@ -163,8 +169,14 @@ def test_meta_and_frontend_only_expose_link_extraction():
     assert meta["defaults"]["checkout_attempts"] == 5
     assert meta["defaults"]["provider_attempts"] == 10
     assert meta["defaults"]["country"] == "BR"
+    assert meta["defaults"]["billing_country"] == "DE"
     assert meta["defaults"]["checkout_country"] == "DE"
     assert meta["defaults"]["batch_concurrency"] == 8
+    assert meta["defaults"]["stripe_checkout"] is False
+    assert meta["defaults"]["stripe_engine"] == "python"
+    assert meta["defaults"]["stripe_promo_strategy"] == "post_update"
+    assert meta["stripe_engines"] == ["python", "go"]
+    assert meta["stripe_promo_strategies"] == ["upfront", "post_update", "mixed"]
     brazil = next(item for item in meta["countries"] if item["code"] == "BR")
     assert brazil["checkout_country"] == "DE"
     assert brazil["checkout_currency"] == "EUR"
@@ -172,9 +184,113 @@ def test_meta_and_frontend_only_expose_link_extraction():
     html = client.get("/").get_data(as_text=True)
     assert "PayPal 提链" in html
     assert 'id="ckSearch"' in html
+    assert 'id="billingCode"' in html
+    assert 'id="bBillingCode"' in html
+    assert 'id="stripeCheckout"' in html
+    assert 'id="bStripeCheckout"' in html
+    assert 'id="stripeEngine"' in html
+    assert 'id="bStripeEngine"' in html
     assert 'id="pmSearch"' not in html
     for forbidden in ("OTP", "Captcha", "手机号", "PIX", "协议支付", "PayPal User"):
         assert forbidden not in html
+    app.extensions["job_manager"].shutdown()
+
+
+def test_job_accepts_stripe_checkout_mode_and_rejects_non_boolean_value():
+    token = make_token()
+    gateway = SuccessGateway()
+    app = create_app({"TESTING": True}, gateway=gateway)
+    client = app.test_client()
+    request = payload(token)
+    request["stripe_checkout"] = True
+
+    snapshot = wait_for_job(
+        client,
+        client.post("/api/jobs", json=request).get_json()["job_id"],
+    )
+
+    assert snapshot["status"] == "success"
+    assert snapshot["config"]["stripe_checkout"] is True
+    assert gateway.checkout_calls[0]["stripe_checkout"] is True
+    request["stripe_checkout"] = {"unexpected": True}
+    response = client.post("/api/jobs", json=request)
+    assert response.status_code == 400
+    assert response.get_json()["error"] == "stripe_checkout 必须是布尔值"
+    app.extensions["job_manager"].shutdown()
+
+
+def test_job_accepts_go_stripe_engine_and_rejects_invalid_combinations():
+    token = make_token()
+    gateway = SuccessGateway()
+    app = create_app({"TESTING": True}, gateway=gateway)
+    client = app.test_client()
+    request = payload(token)
+    request.update(stripe_checkout=True, stripe_engine="go")
+
+    snapshot = wait_for_job(
+        client,
+        client.post("/api/jobs", json=request).get_json()["job_id"],
+    )
+    assert snapshot["config"]["stripe_engine"] == "go"
+    assert gateway.checkout_calls[0]["stripe_engine"] == "go"
+
+    request["stripe_checkout"] = False
+    response = client.post("/api/jobs", json=request)
+    assert response.status_code == 400
+    assert response.get_json()["error"] == "Go 引擎当前只支持 Stripe 链提炼"
+
+    request.update(stripe_checkout=True, stripe_engine="rust")
+    response = client.post("/api/jobs", json=request)
+    assert response.status_code == 400
+    assert response.get_json()["error"] == "stripe_engine 只支持 python 或 go"
+    app.extensions["job_manager"].shutdown()
+
+
+def test_job_accepts_and_validates_stripe_promo_strategy():
+    token = make_token()
+    gateway = SuccessGateway()
+    app = create_app({"TESTING": True}, gateway=gateway)
+    client = app.test_client()
+    request = payload(token)
+    request.update(stripe_checkout=True, stripe_promo_strategy="mixed")
+
+    snapshot = wait_for_job(
+        client,
+        client.post("/api/jobs", json=request).get_json()["job_id"],
+    )
+    assert snapshot["config"]["stripe_promo_strategy"] == "mixed"
+    assert gateway.checkout_calls[0]["stripe_promo_strategy"] == "mixed"
+
+    request["stripe_promo_strategy"] = "unknown"
+    response = client.post("/api/jobs", json=request)
+    assert response.status_code == 400
+    assert response.get_json()["error"] == (
+        "stripe_promo_strategy 只支持 upfront、post_update 或 mixed"
+    )
+    app.extensions["job_manager"].shutdown()
+
+
+def test_job_allows_billing_country_independent_from_proxy_country():
+    token = make_token()
+    gateway = SuccessGateway()
+    app = create_app({"TESTING": True}, gateway=gateway)
+    client = app.test_client()
+    request = payload(token)
+    request["country"] = "BR"
+    request["billing_country"] = "BR"
+
+    snapshot = wait_for_job(
+        client,
+        client.post("/api/jobs", json=request).get_json()["job_id"],
+    )
+
+    assert snapshot["config"]["proxy_country"] == "BR"
+    assert snapshot["config"]["billing_country"] == "BR"
+    assert snapshot["config"]["checkout_country"] == "BR"
+    assert snapshot["config"]["checkout_currency"] == "USD"
+    assert gateway.checkout_calls[0]["proxy_country"].code == "BR"
+    assert gateway.checkout_calls[0]["checkout_country"].code == "BR"
+    assert gateway.checkout_calls[0]["billing"]["address"]["country"] == "BR"
     app.extensions["job_manager"].shutdown()
 
 
@@ -449,6 +565,9 @@ def test_api_rejects_bad_country_proxy_and_removed_payment_fields_are_ignored():
     bad_country = payload(token)
     bad_country["country"] = "XX"
     assert client.post("/api/jobs", json=bad_country).status_code == 400
+    bad_billing_country = payload(token)
+    bad_billing_country["billing_country"] = "XX"
+    assert client.post("/api/jobs", json=bad_billing_country).status_code == 400
     bad_proxy = payload(token)
     bad_proxy["proxies"] = "host:badport:user:very-secret"
     response = client.post("/api/jobs", json=bad_proxy)

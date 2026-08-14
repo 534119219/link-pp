@@ -17,6 +17,17 @@ from handoff.protocol import stripe_checkout as stripe
 from handoff.gateway import preflight_checkout_route
 
 
+def test_chatgpt_context_uses_consistent_firefox_fingerprint():
+    headers = stripe.chatgpt_context_headers(
+        country="DE",
+        device_id="device-test",
+        referer="https://chatgpt.com/",
+    )
+    assert stripe.BROWSER_IMPERSONATE == "firefox147"
+    assert "Firefox/147.0" in headers["User-Agent"]
+    assert not any(key.lower().startswith("sec-ch-ua") for key in headers)
+
+
 def test_verify_chatgpt_account_classifies_cloudflare_challenge_and_logs_trace():
     logs = []
 
@@ -84,16 +95,96 @@ def test_verify_chatgpt_account_wraps_connection_failure_and_logs_error():
 
     assert captured.value.code == "CHATGPT_CONNECTION_FAILED"
     assert "curl: (56)" in str(captured.value)
-    assert any("chatgpt_me" in item and "connection closed abruptly" in item for item in logs)
+    assert any(
+        "chatgpt_page_warmup" in item and "connection closed abruptly" in item
+        for item in logs
+    )
+    assert not any('"kind":"chatgpt_me"' in item for item in logs)
 
 
-def test_preflight_retries_transient_failure_without_consuming_checkout(monkeypatch):
+def test_verify_chatgpt_account_gives_warmup_and_me_independent_timeouts():
+    timeouts = []
+
+    class Http:
+        cookies = {}
+
+        def get(self, url, **kwargs):
+            timeouts.append((url, kwargs["timeout"]))
+            return SimpleNamespace(status_code=200, text="", headers={})
+
+    stripe.verify_chatgpt_account(
+        Http(),
+        "test-at",
+        country="BR",
+        device_id="device-test",
+    )
+
+    assert timeouts == [
+        ("https://chatgpt.com/", stripe.PREFLIGHT_HTTP_TIMEOUT_SECONDS),
+        (
+            "https://chatgpt.com/backend-api/me",
+            stripe.PREFLIGHT_HTTP_TIMEOUT_SECONDS,
+        ),
+    ]
+
+
+def test_verify_stripe_route_wraps_socks_server_failure():
+    logs = []
+
+    class Http:
+        def get(self, url, **kwargs):
+            assert url == "https://api.stripe.com/"
+            assert kwargs["timeout"] == stripe.PREFLIGHT_HTTP_TIMEOUT_SECONDS
+            raise RuntimeError("general SOCKS server failure")
+
+    with pytest.raises(stripe.CheckoutPreflightError) as captured:
+        stripe.verify_stripe_route(Http(), log=logs.append)
+
+    assert captured.value.code == "STRIPE_CONNECTION_FAILED"
+    assert "general SOCKS server failure" in str(captured.value)
+    assert any('"kind":"stripe_preflight"' in item for item in logs)
+
+
+def test_hosted_preflight_checks_stripe_before_chatgpt(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        stripe,
+        "verify_proxy_exit_country",
+        lambda *_args, **_kwargs: calls.append("exit")
+        or {"ip": "203.0.113.10", "country": "BR", "source": "test"},
+    )
+    monkeypatch.setattr(
+        stripe,
+        "verify_stripe_route",
+        lambda *_args, **_kwargs: calls.append("stripe") or 404,
+    )
+    monkeypatch.setattr(
+        stripe,
+        "verify_chatgpt_account",
+        lambda *_args, **_kwargs: calls.append("me"),
+    )
+
+    preflight_checkout_route(
+        http=object(),
+        proxy_country="BR",
+        access_token="test-at",
+        device_id="device-test",
+        require_stripe=True,
+        log=lambda _message: None,
+    )
+
+    assert calls == ["exit", "stripe", "me"]
+
+
+def test_preflight_switches_proxy_without_same_route_retry(monkeypatch):
     calls = []
     renewals = []
     sleeps = []
 
-    def exit_check(_http, _country):
+    def exit_check(_http, _country, **kwargs):
         calls.append("exit")
+        assert kwargs["timeout"] == 5
         return {"ip": "203.0.113.10", "country": "BR", "source": "test"}
 
     def account_check(_http, _token, **_kwargs):
@@ -108,18 +199,20 @@ def test_preflight_retries_transient_failure_without_consuming_checkout(monkeypa
     monkeypatch.setattr(stripe, "verify_chatgpt_account", account_check)
     monkeypatch.setattr(stripe.time, "sleep", sleeps.append)
 
-    preflight_checkout_route(
-        http=object(),
-        proxy_country="BR",
-        access_token="test-at",
-        device_id="device-test",
-        log=lambda _message: None,
-        renew_http=lambda current: renewals.append(current) or object(),
-    )
+    with pytest.raises(stripe.CheckoutPreflightError) as captured:
+        preflight_checkout_route(
+            http=object(),
+            proxy_country="BR",
+            access_token="test-at",
+            device_id="device-test",
+            log=lambda _message: None,
+            renew_http=lambda current: renewals.append(current) or object(),
+        )
 
-    assert calls == ["exit", "me", "exit", "me"]
-    assert len(renewals) == 1
-    assert sleeps == [stripe.PREFLIGHT_RETRY_DELAY_SECONDS]
+    assert captured.value.code == "CHATGPT_CONNECTION_FAILED"
+    assert calls == ["exit", "me"]
+    assert renewals == []
+    assert sleeps == []
 
 
 def test_checkout_response_prefers_oaics_and_sends_country_promo_contract(monkeypatch):
@@ -169,6 +262,47 @@ def test_checkout_response_prefers_oaics_and_sends_country_promo_contract(monkey
     assert captured["headers"]["x-openai-target-route"] == "/backend-api/payments/checkout"
     assert captured["url"] == stripe.OPENAI_CHECKOUT_URL
     assert not captured["url"].endswith("/update")
+
+
+def test_checkout_response_uses_hosted_mode_without_custom_ui_contract(monkeypatch):
+    captured = {}
+
+    class Response:
+        status_code = 200
+        text = json.dumps(
+            {
+                "checkout_session_id": "cs_live_dynamic",
+                "processor_entity": "openai_ie",
+                "data": {"checkout_session_id": "oaics_nested"},
+            }
+        )
+
+        def json(self):
+            return json.loads(self.text)
+
+    class Http:
+        def post(self, *_args, **kwargs):
+            captured.update(kwargs)
+            return Response()
+
+    monkeypatch.setattr(stripe, "_warmup_chatgpt_page", lambda *_args, **_kwargs: None)
+    context = {}
+
+    session_id, error = stripe.create_chatgpt_order(
+        Http(),
+        "test-at",
+        country="DE",
+        currency="EUR",
+        checkout_context=context,
+        with_promo=True,
+        hosted_checkout=True,
+    )
+
+    assert error is None
+    assert session_id == "cs_live_dynamic"
+    assert context["checkout_kind"] == "hosted"
+    assert "checkout_ui_mode" not in captured["json"]
+    assert captured["json"]["promo_campaign"]["promo_campaign_id"] == "plus-1-month-free"
 
 
 def test_checkout_transport_retry_rebuilds_session_and_preserves_diagnostics(monkeypatch):
@@ -263,6 +397,11 @@ def test_stripe_flow_uses_supplied_publishable_key_without_probe(monkeypatch):
     monkeypatch.setattr(stripe, "snapshot_billing", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         stripe,
+        "create_paypal_payment_method",
+        lambda _http, pk, *_args: calls.append(("payment_method", pk)) or "pm_test",
+    )
+    monkeypatch.setattr(
+        stripe,
         "confirm_payment",
         lambda _http, pk, *_args: calls.append(("confirm", pk))
         or {
@@ -286,6 +425,7 @@ def test_stripe_flow_uses_supplied_publishable_key_without_probe(monkeypatch):
     assert calls == [
         ("init", "pk_live_dynamicShard123"),
         ("elements", "pk_live_dynamicShard123"),
+        ("payment_method", "pk_live_dynamicShard123"),
         ("confirm", "pk_live_dynamicShard123"),
     ]
 
@@ -354,6 +494,8 @@ def test_gateway_creates_country_aligned_zero_oaics_checkout(monkeypatch):
         },
         proxy=parse_proxy_lines("checkout.example:1000")[0],
         device_id="device-test",
+        stripe_promo_strategy="post_update",
+        checkout_attempt=2,
         log=lambda _message: None,
     )
 
@@ -361,7 +503,7 @@ def test_gateway_creates_country_aligned_zero_oaics_checkout(monkeypatch):
     assert artifact.processor_entity == "openai_ie"
     assert artifact.country == "DE"
     assert artifact.currency == "EUR"
-    assert build_calls == ["socks5://checkout.example:1000"]
+    assert build_calls == ["socks5h://checkout.example:1000"]
     assert preflight_calls[0]["proxy_country"] == "BR"
     assert calls[0] == "fetch"
     assert calls[1][0:3] == ("taxes", "DE", "EUR")
@@ -398,6 +540,186 @@ def test_gateway_rejects_hosted_checkout_before_stripe_init(monkeypatch):
             billing={"name": "Owner", "email": "owner@example.com", "address": {"country": "DE"}},
             proxy=parse_proxy_lines("checkout.example:1000")[0],
             device_id="device-test",
+            log=lambda _message: None,
+        )
+
+
+def test_gateway_defers_hosted_zero_verification_to_provider_flow(monkeypatch):
+    calls = []
+
+    class Http:
+        def close(self):
+            calls.append("close")
+
+    http = Http()
+    monkeypatch.setattr(stripe, "build_http", lambda proxy: calls.append(("build", proxy)) or http)
+    monkeypatch.setattr(gateway_module, "preflight_checkout_route", lambda **_kwargs: None)
+
+    def create_order(*_args, **kwargs):
+        assert kwargs["hosted_checkout"] is True
+        assert kwargs["with_promo"] is False
+        kwargs["checkout_context"].update(
+            {
+                "processor_entity": "openai_ie",
+                "publishable_key": "pk_live_dynamicShard123",
+                "checkout_url": "https://chatgpt.com/checkout/openai_ie/cs_live_dynamic",
+            }
+        )
+        return "cs_live_dynamic", None
+
+    monkeypatch.setattr(stripe, "create_chatgpt_order_with_retry", create_order)
+    monkeypatch.setattr(
+        stripe,
+        "verify_checkout_zero",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("provider flow must perform the zero-amount verification")
+        ),
+    )
+    monkeypatch.setattr(
+        stripe,
+        "fetch_oaics_checkout_session",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("hosted mode must not fetch OAICS state")
+        ),
+    )
+
+    artifact = LiveProtocolGateway().create_checkout(
+        access_token="test-at",
+        proxy_country=get_country("BR"),
+        checkout_country=get_country("DE"),
+        billing={"name": "Owner", "email": "owner@example.com", "address": {"country": "DE"}},
+        proxy=parse_proxy_lines("checkout.example:1000")[0],
+        device_id="device-test",
+        stripe_checkout=True,
+        log=lambda _message: None,
+    )
+
+    assert artifact.session_id == "cs_live_dynamic"
+    assert artifact.publishable_key == "pk_live_dynamicShard123"
+    assert artifact.checkout_url.endswith("/cs_live_dynamic")
+    assert artifact.amount is None
+    assert calls[0] == ("build", "socks5h://checkout.example:1000")
+    artifact.close_transport()
+
+
+@pytest.mark.parametrize(
+    ("strategy", "checkout_attempt", "expected_promo_on_create"),
+    (
+        ("upfront", 1, True),
+        ("post_update", 1, False),
+        ("mixed", 1, True),
+        ("mixed", 2, False),
+    ),
+)
+def test_gateway_selects_stripe_promo_timing_by_strategy(
+    monkeypatch, strategy, checkout_attempt, expected_promo_on_create
+):
+    class Http:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(stripe, "build_http", lambda _proxy: Http())
+    monkeypatch.setattr(gateway_module, "preflight_checkout_route", lambda **_kwargs: None)
+
+    def create_order(*_args, **kwargs):
+        assert kwargs["with_promo"] is expected_promo_on_create
+        kwargs["checkout_context"].update(
+            processor_entity="openai_ie",
+            publishable_key="pk_live_strategy",
+        )
+        return "cs_live_strategy", None
+
+    monkeypatch.setattr(stripe, "create_chatgpt_order_with_retry", create_order)
+    artifact = LiveProtocolGateway().create_checkout(
+        access_token="test-at",
+        proxy_country=get_country("BR"),
+        checkout_country=get_country("DE"),
+        billing={"name": "Owner", "address": {"country": "DE"}},
+        proxy=parse_proxy_lines("checkout.example:1000")[0],
+        device_id="device-test",
+        stripe_checkout=True,
+        stripe_promo_strategy=strategy,
+        checkout_attempt=checkout_attempt,
+        log=lambda _message: None,
+    )
+
+    assert artifact.promo_on_create is expected_promo_on_create
+    artifact.close_transport()
+
+
+def test_gateway_go_checkout_defers_zero_verification_to_worker(monkeypatch):
+    class Http:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(stripe, "build_http", lambda _proxy: Http())
+    monkeypatch.setattr(gateway_module, "preflight_checkout_route", lambda **_kwargs: None)
+
+    def create_order(*_args, **kwargs):
+        assert kwargs["with_promo"] is False
+        kwargs["checkout_context"].update(
+            {
+                "processor_entity": "openai_ie",
+                "publishable_key": "pk_live_dynamicShard123",
+            }
+        )
+        return "cs_live_dynamic", None
+
+    monkeypatch.setattr(stripe, "create_chatgpt_order_with_retry", create_order)
+    monkeypatch.setattr(
+        stripe,
+        "verify_checkout_zero",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Go Worker must perform the zero-amount verification")
+        ),
+    )
+
+    artifact = LiveProtocolGateway().create_checkout(
+        access_token="test-at",
+        proxy_country=get_country("BR"),
+        checkout_country=get_country("DE"),
+        billing={"name": "Owner", "email": "owner@example.com", "address": {"country": "DE"}},
+        proxy=parse_proxy_lines("checkout.example:1000")[0],
+        device_id="device-test",
+        stripe_checkout=True,
+        stripe_engine="go",
+        log=lambda _message: None,
+    )
+
+    assert artifact.amount is None
+    assert artifact.stripe_engine == "go"
+    artifact.close_transport()
+
+
+def test_gateway_stripe_mode_rejects_oaics_without_amount_probe(monkeypatch):
+    class Http:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(stripe, "build_http", lambda _proxy: Http())
+    monkeypatch.setattr(gateway_module, "preflight_checkout_route", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        stripe,
+        "create_chatgpt_order_with_retry",
+        lambda *_args, **_kwargs: ("oaics_wrong_kind", None),
+    )
+    monkeypatch.setattr(
+        stripe,
+        "verify_checkout_zero",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("wrong checkout kind must be rejected before amount probing")
+        ),
+    )
+
+    with pytest.raises(stripe.StripeCheckoutRequiredError, match="cs_live_"):
+        LiveProtocolGateway().create_checkout(
+            access_token="test-at",
+            proxy_country=get_country("BR"),
+            checkout_country=get_country("DE"),
+            billing={"name": "Owner", "email": "owner@example.com", "address": {"country": "DE"}},
+            proxy=parse_proxy_lines("checkout.example:1000")[0],
+            device_id="device-test",
+            stripe_checkout=True,
             log=lambda _message: None,
         )
 
@@ -833,7 +1155,93 @@ def test_nonzero_or_unverifiable_checkout_stops_before_paypal(
             require_zero_amount=True,
         )
 
-    assert calls == []
+    assert calls == ["elements"]
+
+
+def test_python_stripe_post_update_applies_promo_then_reinitializes(monkeypatch):
+    calls = []
+    snapshots = iter(
+        (
+            (
+                {"total_summary": {"due": 1933}},
+                "version-before",
+                {
+                    "payment_method_types": ["paypal"],
+                    "checkout_amount": 1933,
+                    "currency": "eur",
+                },
+            ),
+            (
+                {"total_summary": {"due": 0}},
+                "version-after",
+                {
+                    "payment_method_types": ["paypal"],
+                    "checkout_amount": 0,
+                    "currency": "eur",
+                },
+            ),
+        )
+    )
+    monkeypatch.setattr(stripe.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(stripe, "verify_pk", lambda *_args: "pk_test")
+    monkeypatch.setattr(
+        stripe,
+        "init_checkout",
+        lambda *_args: calls.append("init") or next(snapshots),
+    )
+    monkeypatch.setattr(
+        stripe,
+        "fetch_elements_session",
+        lambda *_args: calls.append("elements")
+        or {"payment_method_specs": [{"type": "paypal"}]},
+    )
+    monkeypatch.setattr(stripe, "update_tax_region", lambda *_args: calls.append("tax"))
+    monkeypatch.setattr(
+        stripe,
+        "snapshot_billing",
+        lambda *_args, **_kwargs: calls.append("snapshot"),
+    )
+    monkeypatch.setattr(
+        stripe,
+        "create_paypal_payment_method",
+        lambda *_args: calls.append("payment_method") or "pm_test",
+    )
+    monkeypatch.setattr(
+        stripe,
+        "confirm_payment",
+        lambda *_args: calls.append("confirm")
+        or {
+            "next_action": {
+                "redirect_to_url": {
+                    "url": "https://pm-redirects.stripe.com/authorize/updated"
+                }
+            }
+        },
+    )
+
+    redirect, _pk, context = stripe.stripe_to_paypal_redirect(
+        object(),
+        "cs_live_update",
+        billing={"name": "Owner", "address": {"country": "DE"}},
+        country="DE",
+        processor_entity="openai_ie",
+        require_zero_amount=True,
+        apply_promo_callback=lambda entity: calls.append(("update", entity)),
+    )
+
+    assert redirect.endswith("/updated")
+    assert context["checkout_amount"] == 0
+    assert calls == [
+        "init",
+        "elements",
+        ("update", "openai_ie"),
+        "init",
+        "elements",
+        "tax",
+        "snapshot",
+        "payment_method",
+        "confirm",
+    ]
 
 
 def test_explicit_card_only_checkout_stops_before_confirm_or_approve(monkeypatch):
@@ -854,6 +1262,7 @@ def test_explicit_card_only_checkout_stops_before_confirm_or_approve(monkeypatch
         ),
     )
     monkeypatch.setattr(stripe, "fetch_elements_session", lambda *_args: {})
+    monkeypatch.setattr(stripe, "create_paypal_payment_method", lambda *_args: "pm_test")
     monkeypatch.setattr(
         stripe,
         "confirm_payment",
@@ -884,6 +1293,7 @@ def test_approve_blocked_raises_immediately(monkeypatch):
     monkeypatch.setattr(stripe, "verify_pk", lambda *_args: "pk_test")
     monkeypatch.setattr(stripe, "init_checkout", lambda *_args: ({"total_summary": {"due": 0}}, "version", context))
     monkeypatch.setattr(stripe, "fetch_elements_session", lambda *_args: {})
+    monkeypatch.setattr(stripe, "create_paypal_payment_method", lambda *_args: "pm_test")
     monkeypatch.setattr(
         stripe,
         "confirm_payment",
@@ -919,6 +1329,7 @@ def test_approve_blocked_error_message_contains_blocked(monkeypatch):
     monkeypatch.setattr(stripe, "verify_pk", lambda *_args: "pk_test")
     monkeypatch.setattr(stripe, "init_checkout", lambda *_args: ({"total_summary": {"due": 0}}, "version", context))
     monkeypatch.setattr(stripe, "fetch_elements_session", lambda *_args: {})
+    monkeypatch.setattr(stripe, "create_paypal_payment_method", lambda *_args: "pm_test")
     monkeypatch.setattr(
         stripe,
         "confirm_payment",
@@ -941,7 +1352,7 @@ def test_approve_blocked_error_message_contains_blocked(monkeypatch):
         )
 
 
-def test_approval_sentinel_is_prefetched_and_reconfirm_runs_before_poll(monkeypatch):
+def test_approval_sentinel_is_prefetched_before_single_confirm_and_poll(monkeypatch):
     calls = []
     context = {"payment_method_types": ["paypal"], "checkout_amount": 0, "currency": "eur"}
     monkeypatch.setattr(stripe, "verify_pk", lambda *_args: "pk_test")
@@ -973,22 +1384,17 @@ def test_approval_sentinel_is_prefetched_and_reconfirm_runs_before_poll(monkeypa
         lambda *_args, **_kwargs: calls.append("prepare")
         or {"OpenAI-Sentinel-Token": "prefetched", "OAI-Telemetry": "[1,null]"},
     )
-    confirms = [
-        {"submission_attempt": {"state": "requires_approval"}},
-        {
-            "next_action": {
-                "redirect_to_url": {
-                    "url": "https://pm-redirects.stripe.com/authorize/reconfirm"
-                }
-            }
-        },
-    ]
-
-    def confirm(*_args):
-        calls.append("confirm")
-        return confirms.pop(0)
-
-    monkeypatch.setattr(stripe, "confirm_payment", confirm)
+    monkeypatch.setattr(
+        stripe,
+        "create_paypal_payment_method",
+        lambda *_args: calls.append("payment_method") or "pm_test",
+    )
+    monkeypatch.setattr(
+        stripe,
+        "confirm_payment",
+        lambda *_args: calls.append("confirm")
+        or {"submission_attempt": {"state": "requires_approval"}},
+    )
 
     def approve(*_args, **kwargs):
         calls.append("approve")
@@ -999,9 +1405,8 @@ def test_approval_sentinel_is_prefetched_and_reconfirm_runs_before_poll(monkeypa
     monkeypatch.setattr(
         stripe,
         "poll_redirect_after_approve",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("poll must not run before successful re-confirm")
-        ),
+        lambda *_args, **_kwargs: calls.append("poll")
+        or "https://pm-redirects.stripe.com/authorize/polled",
     )
 
     redirect, _pk, _ctx = stripe.stripe_to_paypal_redirect(
@@ -1016,16 +1421,17 @@ def test_approval_sentinel_is_prefetched_and_reconfirm_runs_before_poll(monkeypa
         sentinel_proxy="socks5h://proxy.test:1080",
     )
 
-    assert redirect.endswith("/reconfirm")
+    assert redirect.endswith("/polled")
     assert calls == [
         "init",
         "elements",
         "tax",
         "snapshot",
         "prepare",
+        "payment_method",
         "confirm",
         "approve",
-        "confirm",
+        "poll",
     ]
 
 
@@ -1210,7 +1616,7 @@ def test_resolves_pm_redirect_to_paypal_ba_url():
     assert approval.endswith("ba_token=BA-ABC123")
 
 
-def test_paypal_confirm_uses_inline_payment_method_data():
+def test_paypal_confirm_uses_compact_payment_method_reference():
     captured = []
 
     class Response:
@@ -1273,18 +1679,12 @@ def test_paypal_confirm_uses_inline_payment_method_data():
     assert paypal_data["client_attribution_metadata[client_session_id]"] == "client-session"
     assert paypal_data["client_attribution_metadata[merchant_integration_version]"] == "custom_checkout"
     assert paypal_data["link_brand"] == "link"
-    assert paypal_data["consent[terms_of_service]"] == "accepted"
-    assert paypal_data["return_url"].startswith("https://pay.openai.com/c/pay/cs_test?")
-    assert "success_return_url=" in paypal_data["return_url"]
-    assert paypal_data["payment_method_data[type]"] == "paypal"
-    assert paypal_data["payment_method_data[billing_details][address][country]"] == "DE"
-    assert (
-        paypal_data[
-            "payment_method_data[client_attribution_metadata][merchant_integration_additional_elements][0]"
-        ]
-        == "expressCheckout"
-    )
-    assert "payment_method" not in paypal_data
+    assert paypal_data["payment_method"] == "pm_created_but_not_referenced"
+    assert paypal_data["_stripe_version"] == stripe.PAYPAL_STRIPE_VERSION
+    assert paypal_data["return_url"].startswith("https://checkout.stripe.com/c/pay/cs_test?")
+    assert "redirect_pm_type=paypal" in paypal_data["return_url"]
+    assert "ui_mode=custom" in paypal_data["return_url"]
+    assert "payment_method_data[type]" not in paypal_data
 
 def test_paypal_stripe_flow_updates_tax_and_snapshot_before_confirm(monkeypatch):
     calls = []
@@ -1310,6 +1710,11 @@ def test_paypal_stripe_flow_updates_tax_and_snapshot_before_confirm(monkeypatch)
         stripe,
         "snapshot_billing",
         lambda *_args, **_kwargs: calls.append("snapshot"),
+    )
+    monkeypatch.setattr(
+        stripe,
+        "create_paypal_payment_method",
+        lambda *_args: calls.append("payment_method") or "pm_test",
     )
     monkeypatch.setattr(
         stripe,
@@ -1342,6 +1747,7 @@ def test_paypal_stripe_flow_updates_tax_and_snapshot_before_confirm(monkeypatch)
         "elements",
         "tax",
         "snapshot",
+        "payment_method",
         "confirm",
     ]
 
@@ -1415,3 +1821,132 @@ def test_gateway_stops_after_extracting_paypal_ba_link(monkeypatch):
     assert result.paypal_approve_url.endswith("BA-TEST")
     assert result.provider_redirect_url.endswith("BA-TEST")
     assert result.ba_token == "BA-TEST"
+
+
+def test_gateway_uses_hosted_stripe_provider_flow_for_cs_live_artifact(monkeypatch):
+    calls = []
+
+    class Http:
+        def close(self):
+            calls.append("close")
+
+    http = Http()
+    monkeypatch.setattr(stripe, "build_http", lambda _proxy: calls.append("build") or http)
+    monkeypatch.setattr(gateway_module, "preflight_checkout_route", lambda **_kwargs: calls.append("preflight"))
+
+    def hosted_confirm(_http, session_id, **kwargs):
+        calls.append("stripe_confirm")
+        assert session_id == "cs_live_test"
+        assert kwargs["country"] == "DE"
+        assert kwargs["processor_entity"] == "openai_ie"
+        assert kwargs["publishable_key"] == "pk_live_dynamicShard123"
+        assert kwargs["require_zero_amount"] is True
+        assert kwargs["chatgpt_http"] is http
+        assert kwargs["apply_promo_callback"] is None
+        return "https://pm-redirects.stripe.com/authorize/test", "pk_live_dynamicShard123", {}
+
+    monkeypatch.setattr(stripe, "stripe_to_paypal_redirect", hosted_confirm)
+    monkeypatch.setattr(
+        stripe,
+        "oaics_to_paypal_redirect",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cs_live artifact must not use OAICS provider flow")
+        ),
+    )
+    monkeypatch.setattr(
+        gateway_module,
+        "resolve_paypal_approval_url",
+        lambda *_args, **_kwargs: calls.append("resolve_ba")
+        or (
+            "https://www.paypal.com/agreements/approve?ba_token=BA-STRIPE",
+            "BA-STRIPE",
+        ),
+    )
+
+    result = LiveProtocolGateway().attempt_provider(
+        artifact=CheckoutArtifact(
+            session_id="cs_live_test",
+            processor_entity="openai_ie",
+            country="DE",
+            currency="EUR",
+            checkout_url="https://chatgpt.com/checkout/openai_ie/cs_live_test",
+            amount=0,
+            publishable_key="pk_live_dynamicShard123",
+        ),
+        access_token="test-at",
+        proxy_country=get_country("BR"),
+        checkout_country=get_country("DE"),
+        billing={"name": "Owner", "address": {"country": "DE"}},
+        proxy=parse_proxy_lines("proxy.example:1000")[0],
+        device_id="device",
+        log=lambda _message: None,
+    )
+
+    assert calls == ["build", "preflight", "stripe_confirm", "resolve_ba", "close"]
+    assert result.provider_redirect_url.endswith("/test")
+    assert result.paypal_approve_url.endswith("BA-STRIPE")
+    assert result.ba_token == "BA-STRIPE"
+
+
+def test_gateway_uses_go_worker_for_go_stripe_artifact(monkeypatch):
+    calls = []
+
+    class Cookies:
+        def get_dict(self):
+            return {"oai-did": "device"}
+
+    class Http:
+        cookies = Cookies()
+
+        def close(self):
+            calls.append("close")
+
+    http = Http()
+    monkeypatch.setattr(stripe, "build_http", lambda _proxy: calls.append("build") or http)
+    monkeypatch.setattr(gateway_module, "preflight_checkout_route", lambda **_kwargs: calls.append("preflight"))
+    monkeypatch.setattr(
+        stripe,
+        "prepare_approve_sentinel_headers",
+        lambda *_args, **_kwargs: calls.append("sentinel") or {"OpenAI-Sentinel-Token": "sentinel"},
+    )
+
+    def go_worker(**kwargs):
+        calls.append("go_worker")
+        assert kwargs["currency"] == "EUR"
+        assert kwargs["country"] == "DE"
+        assert kwargs["browser_locale"] == "de-DE"
+        assert kwargs["browser_timezone"] == "Europe/Berlin"
+        assert kwargs["cookie_header"] == "oai-did=device"
+        assert kwargs["apply_promo"] is False
+        return "https://pm-redirects.stripe.com/authorize/go-test"
+
+    monkeypatch.setattr(gateway_module, "run_go_stripe_worker", go_worker)
+    monkeypatch.setattr(
+        gateway_module,
+        "resolve_paypal_approval_url",
+        lambda *_args, **_kwargs: calls.append("resolve_ba")
+        or ("https://www.paypal.com/agreements/approve?ba_token=BA-GO", "BA-GO"),
+    )
+
+    result = LiveProtocolGateway().attempt_provider(
+        artifact=CheckoutArtifact(
+            session_id="cs_live_go",
+            processor_entity="openai_ie",
+            country="DE",
+            currency="EUR",
+            checkout_url="https://chatgpt.com/checkout/openai_ie/cs_live_go",
+            amount=0,
+            stripe_engine="go",
+            publishable_key="pk_live_go",
+        ),
+        access_token="test-at",
+        proxy_country=get_country("BR"),
+        checkout_country=get_country("DE"),
+        billing={"name": "Owner", "email": "owner@example.com", "address": {"country": "DE"}},
+        proxy=parse_proxy_lines("proxy.example:1000")[0],
+        device_id="device",
+        log=lambda _message: None,
+    )
+
+    assert calls == ["build", "preflight", "sentinel", "go_worker", "resolve_ba", "close"]
+    assert result.ba_token == "BA-GO"

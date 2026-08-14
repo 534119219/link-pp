@@ -3,7 +3,7 @@
 主流程创建 ``oaics_`` 自定义 Checkout，经 ChatGPT taxes、Stripe
 ConfirmationToken 与 Checkout confirm 获取 PayPal 跳转。真正的 ``cpmt_``
 支付方式仍使用 custom_payment_method/start。文件后半保留旧版
-``cs_live_`` Stripe Hosted 辅助函数，供兼容测试和诊断使用，生产网关不再调用。
+``cs_live_`` Stripe Hosted 辅助函数，在显式选择 Stripe 提链时由生产网关调用。
 
 移植自 Gpt-Agreement-Payment/CTF-pay/card/_monolith.py 的 Stripe 部分：
   fetch_publishable_key / init_checkout / fetch_elements_session /
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import random
 import re
 import string
@@ -35,19 +36,28 @@ STRIPE_VERSION_FULL = (
     "2025-03-31.basil; checkout_server_update_beta=v1; "
     "checkout_manual_approval_preview=v1"
 )
+PAYPAL_STRIPE_VERSION = (
+    "2020-08-27;custom_checkout_beta=v1; "
+    "checkout_server_update_beta=v1; checkout_manual_approval_preview=v1"
+)
 DEFAULT_STRIPE_RUNTIME_VERSION = "6f8494a281"
 CHECKOUT_SESSION_ATTEMPTS_DEFAULT = 3
 CHECKOUT_SESSION_ATTEMPTS_MIN = 1
 ZERO_AMOUNT_VERIFY_ATTEMPTS = 4
 ZERO_AMOUNT_VERIFY_DELAY_SECONDS = 0.8
-# Keep the account preflight bounded.  A fresh session is useful for a broken
-# proxy connection, but retrying indefinitely only amplifies upstream rate
-# limits and Cloudflare challenges.
-PREFLIGHT_RETRY_ATTEMPTS = 2
-PREFLIGHT_RETRY_DELAY_SECONDS = 0.25
-# Batch workers may be higher for throughput, but the account/page preflight
-# should be gently paced to avoid a burst of identical edge requests.
-PREFLIGHT_CONCURRENCY = 3
+# Preflight is intentionally aggressive: a slow route is less useful than the
+# next proxy in the pool. Real Checkout and confirm requests retain their
+# longer protocol-specific timeouts.
+PREFLIGHT_RETRY_ATTEMPTS = 1
+PREFLIGHT_RETRY_DELAY_SECONDS = 0
+PREFLIGHT_HTTP_TIMEOUT_SECONDS = max(
+    1,
+    min(15, int(os.environ.get("HANDOFF_PREFLIGHT_TIMEOUT", "5"))),
+)
+PREFLIGHT_CONCURRENCY = max(
+    1,
+    min(20, int(os.environ.get("HANDOFF_PREFLIGHT_CONCURRENCY", "20"))),
+)
 _PREFLIGHT_SEMAPHORE = threading.BoundedSemaphore(PREFLIGHT_CONCURRENCY)
 
 OPENAI_IE_COUNTRIES = {
@@ -56,16 +66,10 @@ OPENAI_IE_COUNTRIES = {
     "LV", "MT", "NL", "NO", "PL", "PT", "RO", "SE", "SI", "SK",
 }
 
-CHROME_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/146.0.7423.118 Safari/537.36"
-)
-CHROME_FULL_VERSION = "146.0.7423.118"
-SEC_CH_UA = '"Chromium";v="146", "Google Chrome";v="146", "Not.A/Brand";v="99"'
-SEC_CH_UA_FULL_VERSION_LIST = (
-    '"Chromium";v="146.0.7423.118", '
-    '"Google Chrome";v="146.0.7423.118", '
-    '"Not.A/Brand";v="99.0.0.0"'
+BROWSER_IMPERSONATE = "firefox147"
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) "
+    "Gecko/20100101 Firefox/147.0"
 )
 CHATGPT_CLIENT_VERSION = "prod-db390ebea64862bf1899c420a4c736e0cf639747"
 CHATGPT_CLIENT_BUILD_NUMBER = "7904904"
@@ -196,6 +200,17 @@ class OaicsCheckoutRequiredError(RuntimeError):
         )
 
 
+class StripeCheckoutRequiredError(RuntimeError):
+    """The hosted Stripe flow received an OAICS custom Checkout instead."""
+
+    def __init__(self, session_id: str):
+        self.session_id = str(session_id or "")
+        super().__init__(
+            "上游返回 OAICS Checkout "
+            f"(session={self.session_id or 'unknown'})，未生成当前流程需要的 cs_live_ 链"
+        )
+
+
 class OaicsConfirmBlockedError(RuntimeError):
     """OAICS custom-payment confirmation stayed blocked after fresh proofs."""
 
@@ -240,11 +255,7 @@ def chatgpt_context_headers(
     headers = {
         "Accept-Language": f"{browser_language},{language};q=0.9,en;q=0.8",
         "Referer": referer,
-        "User-Agent": CHROME_UA,
-        "sec-ch-ua": SEC_CH_UA,
-        "sec-ch-ua-full-version-list": SEC_CH_UA_FULL_VERSION_LIST,
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
+        "User-Agent": BROWSER_UA,
         "sec-fetch-dest": "empty",
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-origin",
@@ -278,12 +289,16 @@ def _extract_ip_country(source: str, payload: dict[str, Any]) -> tuple[str, str]
 def verify_proxy_exit_country(http, expected_country: str, *, timeout: int = 12) -> dict[str, str]:
     expected = str(expected_country or "").strip().upper()
     failures: list[str] = []
+    deadline = time.monotonic() + max(0.1, float(timeout))
     for source, url in IP_CHECK_SOURCES:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
             response = http.get(
                 url,
-                headers={"User-Agent": CHROME_UA, "Accept": "application/json"},
-                timeout=timeout,
+                headers={"User-Agent": BROWSER_UA, "Accept": "application/json"},
+                timeout=remaining,
             )
             status = int(getattr(response, "status_code", 599) or 599)
             if status >= 400:
@@ -351,6 +366,8 @@ def verify_chatgpt_account(
         country=country,
         device_id=device_id,
         log=log,
+        timeout=PREFLIGHT_HTTP_TIMEOUT_SECONDS,
+        fail_on_error=True,
     )
     path = "/backend-api/me"
     headers = {
@@ -365,7 +382,11 @@ def verify_chatgpt_account(
         ),
     }
     try:
-        response = http.get("https://chatgpt.com/backend-api/me", headers=headers, timeout=30)
+        response = http.get(
+            "https://chatgpt.com/backend-api/me",
+            headers=headers,
+            timeout=PREFLIGHT_HTTP_TIMEOUT_SECONDS,
+        )
     except Exception as exc:
         _protocol_diagnostic(
             log,
@@ -416,6 +437,48 @@ def verify_chatgpt_account(
             f"ChatGPT /me 预检失败 HTTP {status}: {text[:200]}",
             code="CHATGPT_PREFLIGHT_FAILED",
         )
+
+
+def verify_stripe_route(
+    http,
+    *,
+    log: Callable[[str], None] = lambda _message: None,
+) -> int:
+    route = "/"
+    try:
+        response = http.get(
+            f"{STRIPE_API}{route}",
+            headers=_stripe_headers(),
+            timeout=PREFLIGHT_HTTP_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        _protocol_diagnostic(
+            log,
+            kind="stripe_preflight",
+            method="GET",
+            route=route,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise CheckoutPreflightError(
+            f"Stripe 连接失败: {type(exc).__name__}: {exc}",
+            code="STRIPE_CONNECTION_FAILED",
+        ) from exc
+    status = int(getattr(response, "status_code", 0) or 0)
+    _protocol_diagnostic(
+        log,
+        kind="stripe_preflight",
+        method="GET",
+        route=route,
+        status=status,
+        response_payload={"reachable": status > 0},
+        response=response,
+    )
+    if status <= 0:
+        raise CheckoutPreflightError(
+            "Stripe 连接失败: 未收到 HTTP 响应",
+            code="STRIPE_CONNECTION_FAILED",
+        )
+    return status
 
 
 def _profile(country: str) -> dict:
@@ -480,7 +543,7 @@ def _locale_short(profile: dict) -> str:
 
 def _stripe_headers() -> dict:
     return {
-        "User-Agent": CHROME_UA,
+        "User-Agent": BROWSER_UA,
         "Accept": "application/json",
         "Origin": "https://js.stripe.com",
         "Referer": "https://js.stripe.com/",
@@ -636,6 +699,8 @@ def _warmup_chatgpt_page(
     country: str,
     device_id: str,
     log: Callable[[str], None],
+    timeout: float = 30,
+    fail_on_error: bool = False,
 ) -> None:
     """Warm the real page in the same session so cookies and context stay aligned."""
     # Checkout creation and account preflight share a session.  Avoid a
@@ -661,7 +726,7 @@ def _warmup_chatgpt_page(
                 "sec-fetch-mode": "navigate",
                 "sec-fetch-site": "same-origin",
             },
-            timeout=30,
+            timeout=timeout,
         )
         status = int(getattr(response, "status_code", 0) or 0)
         _protocol_diagnostic(
@@ -682,6 +747,17 @@ def _warmup_chatgpt_page(
             },
             response=response,
         )
+        challenge = _is_cloudflare_challenge(response)
+        if fail_on_error and challenge:
+            raise CheckoutPreflightError(
+                "ChatGPT 页面预热 HTTP 403: Cloudflare Challenge",
+                code="CLOUDFLARE_CHALLENGE",
+            )
+        if fail_on_error and status >= 400:
+            raise CheckoutPreflightError(
+                f"ChatGPT 页面预热失败 HTTP {status}",
+                code="CHATGPT_PREFLIGHT_FAILED",
+            )
         if status >= 400:
             log(f"[context] 页面预热返回 HTTP {status}（继续）")
         else:
@@ -690,6 +766,8 @@ def _warmup_chatgpt_page(
             except Exception:
                 pass
             log("[context] 页面与 Cookie 上下文已对齐")
+    except CheckoutPreflightError:
+        raise
     except Exception as exc:
         _protocol_diagnostic(
             log,
@@ -702,14 +780,19 @@ def _warmup_chatgpt_page(
             },
             error=f"{type(exc).__name__}: {exc}",
         )
+        if fail_on_error:
+            raise CheckoutPreflightError(
+                f"ChatGPT 页面预热连接失败: {type(exc).__name__}: {exc}",
+                code="CHATGPT_CONNECTION_FAILED",
+            ) from exc
         log(f"[context] 页面预热失败（继续）: {type(exc).__name__}: {exc}")
 
 
 def build_http(proxy: Optional[str]):
-    """curl_cffi Session（Chrome 146 TLS 指纹），使用指定代理。"""
+    """curl_cffi Session（Firefox 147 TLS 指纹），使用指定代理。"""
     from curl_cffi.requests import Session as CffiSession
 
-    http = CffiSession(impersonate="chrome146")
+    http = CffiSession(impersonate=BROWSER_IMPERSONATE)
     try:
         http.trust_env = False
     except Exception:
@@ -830,9 +913,10 @@ def create_chatgpt_order(
     sentinel_proxy: str = "",
     checkout_context: Optional[dict[str, str]] = None,
     with_promo: bool = True,
+    hosted_checkout: bool = False,
     log: Callable[[str], None] = lambda m: None,
 ) -> tuple[Optional[str], Optional[str]]:
-    """POST Checkout once and return the OAICS or hosted session identifier."""
+    """POST Checkout once and return the requested OAICS or hosted session identifier."""
     if checkout_context is not None:
         checkout_context.clear()
     _set_oai_device_cookie(http, device_id)
@@ -864,7 +948,7 @@ def create_chatgpt_order(
             "chatgpt_checkout",
             SentinelCtx(
                 device_id=device_id,
-                user_agent=CHROME_UA,
+                user_agent=BROWSER_UA,
                 proxy=sentinel_proxy,
                 country=country,
                 page_url="https://chatgpt.com/",
@@ -883,8 +967,9 @@ def create_chatgpt_order(
             "country": (country or "US").upper(),
             "currency": (currency or "USD").upper(),
         },
-        "checkout_ui_mode": "custom",
     }
+    if not hosted_checkout:
+        body["checkout_ui_mode"] = "custom"
     body["check_card_proxy"] = True
     if with_promo:
         body["promo_campaign"] = {
@@ -936,11 +1021,19 @@ def create_chatgpt_order(
             text,
         )
     )
-    # OAICS is the required application Checkout. Prefer it even when a nested
-    # hosted Stripe identifier is also present in the response.
-    match = re.search(r"oaics_[A-Za-z0-9_-]+", searchable)
-    if match is None:
-        match = re.search(r"cs_(?:live|test)_[A-Za-z0-9_-]+", searchable)
+    patterns = (
+        (r"cs_(?:live|test)_[A-Za-z0-9_-]+", r"oaics_[A-Za-z0-9_-]+")
+        if hosted_checkout
+        else (r"oaics_[A-Za-z0-9_-]+", r"cs_(?:live|test)_[A-Za-z0-9_-]+")
+    )
+    # A direct checkout_session_id is authoritative. In particular, an OAICS
+    # payload can contain an internal cs_live identifier that is not a Hosted
+    # Checkout page and must not be selected as the requested Stripe flow.
+    direct_match = re.fullmatch(
+        r"(?:oaics|cs_(?:live|test))_[A-Za-z0-9_-]+",
+        raw_sid,
+    )
+    match = direct_match or re.search(patterns[0], searchable) or re.search(patterns[1], searchable)
     sid = match.group(0) if match else None
     if sid:
         if checkout_context is not None:
@@ -981,6 +1074,7 @@ def create_chatgpt_order_with_retry(
     sentinel_proxy: str = "",
     checkout_context: Optional[dict[str, str]] = None,
     with_promo: bool = True,
+    hosted_checkout: bool = False,
     max_attempts: Any = CHECKOUT_SESSION_ATTEMPTS_DEFAULT,
     is_cancelled: Optional[Callable[[], bool]] = None,
     renew_http: Optional[Callable[[Any], Any]] = None,
@@ -1002,6 +1096,7 @@ def create_chatgpt_order_with_retry(
             sentinel_proxy=sentinel_proxy,
             checkout_context=checkout_context,
             with_promo=with_promo,
+            hosted_checkout=hosted_checkout,
             log=log,
         )
         if session_id:
@@ -1701,7 +1796,7 @@ def confirm_oaics_standard_paypal(
         "checkout_session_approval",
         SentinelCtx(
             device_id=device_id,
-            user_agent=CHROME_UA,
+            user_agent=BROWSER_UA,
             proxy=sentinel_proxy,
             country=country,
             page_url=checkout_url,
@@ -1945,7 +2040,7 @@ def confirm_oaics_custom_payment_method(
         "checkout_session_approval",
         SentinelCtx(
             device_id=device_id,
-            user_agent=CHROME_UA,
+            user_agent=BROWSER_UA,
             proxy=sentinel_proxy,
             country=country,
             page_url=checkout_url,
@@ -2526,6 +2621,76 @@ def update_tax_region(
     return payload
 
 
+def update_checkout_promo(
+    http,
+    access_token: str,
+    session_id: str,
+    processor_entity: str,
+    *,
+    device_id: str = "",
+    country: str = "US",
+    log: Callable[[str], None] = lambda _message: None,
+) -> dict[str, Any]:
+    route = "/backend-api/payments/checkout/update"
+    payload = {
+        "checkout_session_id": session_id,
+        "processor_entity": processor_entity,
+        "plan_name": "chatgptplusplan",
+        "price_interval": "month",
+        "seat_quantity": 1,
+        "discount_code": None,
+        "promo_campaign": {
+            "promo_campaign_id": "plus-1-month-free",
+            "is_coupon_from_query_param": False,
+        },
+    }
+    headers = {
+        "authorization": f"Bearer {access_token}",
+        "content-type": "application/json",
+        "accept": "*/*",
+        "origin": "https://chatgpt.com",
+        "x-openai-target-path": route,
+        "x-openai-target-route": route,
+        **chatgpt_context_headers(
+            country=country,
+            device_id=device_id,
+            referer=f"https://chatgpt.com/checkout/{processor_entity}/{session_id}",
+        ),
+    }
+    try:
+        response = http.post(
+            f"https://chatgpt.com{route}",
+            json=payload,
+            headers=headers,
+            timeout=45,
+        )
+    except Exception as exc:
+        _protocol_diagnostic(
+            log,
+            kind="checkout_promo_update",
+            method="POST",
+            route=route,
+            request_payload=payload,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise
+    status = int(getattr(response, "status_code", 0) or 0)
+    response_payload = _diagnostic_response_payload(response)
+    _protocol_diagnostic(
+        log,
+        kind="checkout_promo_update",
+        method="POST",
+        route=route,
+        status=status,
+        request_payload=payload,
+        response_payload=response_payload,
+        response=response,
+    )
+    if status != 200:
+        raise RuntimeError(f"Stripe 后置优惠更新失败 HTTP {status}")
+    return response_payload if isinstance(response_payload, dict) else {}
+
+
 def snapshot_billing(
     chatgpt_http,
     access_token: str,
@@ -2633,36 +2798,28 @@ def create_paypal_payment_method(http, pk: str, billing: dict, session_id: str, 
     return pm_id
 
 
-def _stripe_confirm_return_url(session_id: str, init_resp: dict, ctx: dict) -> str:
-    """Build the pay.openai.com return URL used by Custom Checkout."""
-    stripe_hosted_url = str(
+def _paypal_return_url(session_id: str, init_resp: dict, ctx: dict) -> str:
+    """Build Stripe Custom Checkout's PayPal return URL."""
+    hosted = str(
         ctx.get("stripe_hosted_url") or init_resp.get("stripe_hosted_url") or ""
     ).strip()
-    success_return_url = str(
-        ctx.get("return_url")
-        or init_resp.get("return_url")
-        or init_resp.get("url")
-        or ""
-    ).strip()
-    processor_entity = str(ctx.get("processor_entity") or "").strip()
-    if not success_return_url:
-        processor_entity = processor_entity or "openai_llc"
-        success_return_url = (
-            "https://chatgpt.com/checkout/verify"
-            f"?stripe_session_id={session_id}"
-            f"&processor_entity={processor_entity}&plan_type=plus"
-        )
-
-    hosted_url = stripe_hosted_url or f"https://pay.openai.com/c/pay/{session_id}"
-    parsed = urlsplit(hosted_url)
-    host = parsed.netloc
-    if host.lower() == "checkout.stripe.com":
-        host = "pay.openai.com"
+    if hosted.startswith("https://pay.openai.com"):
+        hosted = "https://checkout.stripe.com" + hosted[len("https://pay.openai.com"):]
+    if not hosted:
+        hosted = f"https://checkout.stripe.com/c/pay/{session_id}"
+    parsed = urlsplit(hosted)
     query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    query.pop("return_url", None)
-    query["success_return_url"] = success_return_url
+    query["redirect_pm_type"] = "paypal"
+    query["lid"] = str(uuid.uuid4())
+    query["ui_mode"] = "custom"
     return urlunsplit(
-        (parsed.scheme or "https", host, parsed.path, urlencode(query), parsed.fragment)
+        (
+            parsed.scheme or "https",
+            parsed.netloc or "checkout.stripe.com",
+            parsed.path,
+            urlencode(query),
+            parsed.fragment,
+        )
     )
 
 
@@ -2682,12 +2839,9 @@ def confirm_payment(
     guid, muid, sid = ctx.get("guid"), ctx.get("muid"), ctx.get("sid")
     if not (guid and muid and sid):
         guid, muid, sid = _gen_fingerprint()
+    ctx["guid"], ctx["muid"], ctx["sid"] = guid, muid, sid
     runtime_version = ctx.get("runtime_version") or DEFAULT_STRIPE_RUNTIME_VERSION
-    locale_short = ctx.get("locale") or _locale_short(profile)
     top_checkout_config_id = ctx.get("config_id", "")
-    elements_session_config_id = ctx.get("elements_session_config_id") or str(uuid.uuid4())
-    stripe_js_id = ctx.get("stripe_js_id", str(uuid.uuid4()))
-    elements_session_id = ctx.get("elements_session_id", _gen_elements_session_id())
     init_checksum = init_resp.get("init_checksum", "")
 
     total = init_resp.get("total_summary") or {}
@@ -2699,86 +2853,29 @@ def confirm_payment(
     elif (init_resp.get("invoice") or {}).get("amount_due") is not None:
         expected_amount = str(init_resp["invoice"]["amount_due"])
 
+    if expected_payment_method_type != "paypal" or not str(pm_id).startswith("pm_"):
+        raise RuntimeError("PayPal compact confirm 缺少有效 pm_*")
+    client_session_id = ctx.get("client_session_id") or str(uuid.uuid4())
+    ctx["client_session_id"] = client_session_id
     data = {
         "eid": "NA",
+        "payment_method": pm_id,
         "guid": guid, "muid": muid, "sid": sid,
         "expected_amount": expected_amount,
-        "expected_payment_method_type": expected_payment_method_type,
+        "expected_payment_method_type": "paypal",
         "key": pk,
-        "_stripe_version": STRIPE_VERSION_FULL,
+        "_stripe_version": PAYPAL_STRIPE_VERSION,
         "init_checksum": init_checksum,
         "version": runtime_version,
-        "return_url": _stripe_confirm_return_url(session_id, init_resp, ctx),
-        "elements_session_client[elements_init_source]": "custom_checkout",
-        "elements_session_client[referrer_host]": "chatgpt.com",
-        "elements_session_client[stripe_js_id]": stripe_js_id,
-        "elements_session_client[locale]": locale_short,
-        "elements_session_client[is_aggregation_expected]": "false",
-        "elements_session_client[session_id]": elements_session_id,
-        "elements_session_client[client_betas][0]": "custom_checkout_server_updates_1",
-        "elements_session_client[client_betas][1]": "custom_checkout_manual_approval_1",
-        "client_attribution_metadata[client_session_id]": ctx.get(
-            "client_session_id", stripe_js_id
-        ),
+        "return_url": _paypal_return_url(session_id, init_resp, ctx),
+        "client_attribution_metadata[client_session_id]": client_session_id,
         "client_attribution_metadata[checkout_session_id]": session_id,
         "client_attribution_metadata[checkout_config_id]": top_checkout_config_id,
-        "client_attribution_metadata[elements_session_id]": elements_session_id,
-        "client_attribution_metadata[elements_session_config_id]": elements_session_config_id,
         "client_attribution_metadata[merchant_integration_source]": "checkout",
-        "client_attribution_metadata[merchant_integration_subtype]": "payment-element",
         "client_attribution_metadata[merchant_integration_version]": "custom_checkout",
-        "client_attribution_metadata[payment_intent_creation_flow]": "deferred",
         "client_attribution_metadata[payment_method_selection_flow]": "automatic",
-        "client_attribution_metadata[merchant_integration_additional_elements][0]": "payment",
-        "client_attribution_metadata[merchant_integration_additional_elements][1]": "address",
-        "consent[terms_of_service]": "accepted",
         "link_brand": "link",
     }
-    data.update(ctx.get("elements_options_client") or _elements_options_client_payload())
-    if expected_payment_method_type == "paypal":
-        billing = ctx.get("billing") or {}
-        address = billing.get("address") or {}
-        payment_method_data = {
-            "payment_method_data[type]": "paypal",
-            "payment_method_data[billing_details][name]": billing.get("name", ""),
-            "payment_method_data[billing_details][email]": billing.get("email", ""),
-            "payment_method_data[billing_details][address][country]": address.get(
-                "country", "US"
-            ),
-            "payment_method_data[billing_details][address][line1]": address.get(
-                "line1", ""
-            ),
-            "payment_method_data[billing_details][address][city]": address.get("city", ""),
-            "payment_method_data[billing_details][address][postal_code]": address.get(
-                "postal_code", ""
-            ),
-            "payment_method_data[client_attribution_metadata][client_session_id]": stripe_js_id,
-            "payment_method_data[client_attribution_metadata][checkout_session_id]": session_id,
-            "payment_method_data[client_attribution_metadata][checkout_config_id]": top_checkout_config_id,
-            "payment_method_data[client_attribution_metadata][elements_session_id]": elements_session_id,
-            "payment_method_data[client_attribution_metadata][elements_session_config_id]": elements_session_config_id,
-            "payment_method_data[client_attribution_metadata][merchant_integration_source]": "elements",
-            "payment_method_data[client_attribution_metadata][merchant_integration_subtype]": "payment-element",
-            "payment_method_data[client_attribution_metadata][merchant_integration_version]": "2021",
-            "payment_method_data[client_attribution_metadata][payment_intent_creation_flow]": "deferred",
-            "payment_method_data[client_attribution_metadata][payment_method_selection_flow]": "automatic",
-            "payment_method_data[client_attribution_metadata][merchant_integration_additional_elements][0]": "expressCheckout",
-            "payment_method_data[client_attribution_metadata][merchant_integration_additional_elements][1]": "payment",
-            "payment_method_data[client_attribution_metadata][merchant_integration_additional_elements][2]": "address",
-            "payment_method_data[payment_user_agent]": (
-                f"stripe.js/{runtime_version}; stripe-js-v3/{runtime_version}; "
-                "payment-element; deferred-intent"
-            ),
-            "payment_method_data[referrer]": "https://chatgpt.com",
-            "payment_method_data[time_on_page]": str(random.randint(25000, 55000)),
-        }
-        if address.get("state"):
-            payment_method_data[
-                "payment_method_data[billing_details][address][state]"
-            ] = address["state"]
-        data.update(payment_method_data)
-    else:
-        data["payment_method"] = pm_id
 
     url = f"{STRIPE_API}/v1/payment_pages/{session_id}/confirm"
     resp = http.post(url, data=data, headers=_stripe_headers(), timeout=30)
@@ -2907,7 +3004,7 @@ def prepare_approve_sentinel_headers(
         "checkout_session_approval",
         SentinelCtx(
             device_id=device_id,
-            user_agent=CHROME_UA,
+            user_agent=BROWSER_UA,
             proxy=sentinel_proxy,
             country=country,
             page_url=checkout_page_url,
@@ -3005,15 +3102,8 @@ def poll_redirect_after_approve(
     *,
     phase: str = "approve 后",
     payment_method_id: str = "",
-    suppress_risk_decline: bool = False,
 ) -> str:
-    """GET /payment_pages/<id> 轮询，等待 next_action.redirect_to_url。
-
-    When suppress_risk_decline is True (approve returned "approved"), treat
-    generic_decline in the poll response as stale data from the earlier confirm
-    and continue polling instead of raising immediately.  This allows the flow
-    to fall through to the second-confirm path if the redirect never materializes.
-    """
+    """GET /payment_pages/<id> 轮询，等待 next_action.redirect_to_url。"""
     params = {
         "key": pk,
         "_stripe_version": STRIPE_VERSION_FULL,
@@ -3040,12 +3130,7 @@ def poll_redirect_after_approve(
         url = extract_redirect_url(gj)
         if url:
             return url
-        if suppress_risk_decline:
-            # approve 已通过：poll 中的 generic_decline 是 confirm 时残留的，
-            # 不应作为新的风控拒绝抛出，继续等待 redirect 或超时后走二次 confirm。
-            pass
-        else:
-            _raise_for_current_paypal_risk_decline(gj, payment_method_id)
+        _raise_for_current_paypal_risk_decline(gj, payment_method_id)
         sa = (gj.get("submission_attempt") or {}).get("state")
         log(f"[stripe] {phase} poll {i + 1}: sub_state={sa}")
         time.sleep(1)
@@ -3078,34 +3163,76 @@ def stripe_to_paypal_redirect(
     access_token: str = "",
     device_id: str = "",
     sentinel_proxy: str = "",
+    apply_promo_callback: Optional[Callable[[str], Any]] = None,
     log: Callable[[str], None] = lambda m: None,
 ) -> tuple[str, str, dict]:
-    """init→elements→create paypal pm→confirm(→manual approve)，返回 (redirect_url, pk, ctx)。"""
+    """Run one Stripe PayPal submission without creating a second confirm."""
     profile = _profile(country)
     pk = str(publishable_key or "").strip() or verify_pk(http, session_id, log)
     init_data, version, ctx = init_checkout(http, session_id, pk, profile, log)
     pe = processor_entity or _default_processor_entity(country)
     ctx["processor_entity"] = pe
-    if require_zero_amount:
-        is_zero, amount_detail, amount = verify_zero_amount_snapshot(init_data, ctx)
-        if not is_zero:
-            raise PromoNotAppliedError(
+
+    def require_paypal(payload: dict, context: dict) -> None:
+        methods = [str(value).lower() for value in context.get("payment_method_types") or []]
+        explicit = isinstance(payload.get("payment_method_types"), list) or isinstance(
+            payload.get("payment_method_specs"), list
+        )
+        if explicit and "paypal" not in methods:
+            raise PayPalFundingUnavailableError(
                 session_id,
-                amount if amount is not None else "unknown",
-                str(ctx.get("currency") or ""),
-                amount_detail,
+                methods,
+                "Stripe init 明确未提供 PayPal",
             )
-        # The checkout/provider attempt lines already show progress; keep the
-        # detailed amount snapshot out of the user-facing log.
-    elements_data = fetch_elements_session(http, pk, session_id, ctx, version, profile, log)
+
+    require_paypal(init_data, ctx)
+    elements_data = fetch_elements_session(
+        http, pk, session_id, ctx, version, profile, log
+    )
+    require_paypal(
+        {"payment_method_specs": elements_data.get("payment_method_specs")}, ctx
+    )
+
+    is_zero, amount_detail, amount = verify_zero_amount_snapshot(init_data, ctx)
+    if not is_zero and apply_promo_callback is not None:
+        apply_promo_callback(pe)
+        log("[stripe] 后置优惠已提交，等待 Stripe 金额同步")
+        for sync_attempt in range(6):
+            time.sleep(0.8 if sync_attempt == 0 else 1.5)
+            init_data, version, ctx = init_checkout(
+                http, session_id, pk, profile, log
+            )
+            ctx["processor_entity"] = pe
+            require_paypal(init_data, ctx)
+            is_zero, amount_detail, amount = verify_zero_amount_snapshot(
+                init_data, ctx
+            )
+            if is_zero:
+                break
+        if is_zero:
+            elements_data = fetch_elements_session(
+                http, pk, session_id, ctx, version, profile, log
+            )
+            require_paypal(
+                {"payment_method_specs": elements_data.get("payment_method_specs")},
+                ctx,
+            )
+    if require_zero_amount and not is_zero:
+        raise PromoNotAppliedError(
+            session_id,
+            amount if amount is not None else "unknown",
+            str(ctx.get("currency") or ""),
+            amount_detail,
+        )
+
     ctx["billing"] = billing
     update_tax_region(http, session_id, pk, version, ctx, billing, profile, log)
     if require_zero_amount:
         updated_amount = _minor_amount(ctx.get("checkout_amount"))
-        if updated_amount is not None and updated_amount != 0:
+        if updated_amount is None or updated_amount != 0:
             raise PromoNotAppliedError(
                 session_id,
-                updated_amount,
+                updated_amount if updated_amount is not None else "unknown",
                 str(ctx.get("currency") or ""),
                 "tax_region 更新后金额不是 0",
             )
@@ -3113,25 +3240,11 @@ def stripe_to_paypal_redirect(
         chatgpt_http,
         access_token,
         session_id,
-        processor_entity or _default_processor_entity(country),
+        pe,
         billing,
         log,
         device_id=device_id,
     )
-    payment_method_types = [
-        str(value).lower() for value in (ctx.get("payment_method_types") or [])
-    ]
-    methods_are_explicit = (
-        isinstance(init_data.get("payment_method_types"), list)
-        or isinstance(init_data.get("payment_method_specs"), list)
-        or isinstance(elements_data.get("payment_method_specs"), list)
-    )
-    if methods_are_explicit and "paypal" not in payment_method_types:
-        raise PayPalFundingUnavailableError(
-            session_id,
-            payment_method_types,
-            "Stripe init/elements 明确未提供 PayPal",
-        )
 
     prepared_approve_headers: dict[str, str] = {}
     if (
@@ -3150,10 +3263,10 @@ def stripe_to_paypal_redirect(
             country=country,
         )
 
-    # PayPal must be submitted inline. Creating a separate pm_* first produces
-    # a second, unrelated payment-method context and breaks decline attribution.
-    pm_id = ""
-    log("[stripe] PayPal confirm 使用内联 payment_method_data")
+    pm_id = create_paypal_payment_method(
+        http, pk, billing, session_id, version, ctx, log
+    )
+    log("[stripe] PayPal confirm 使用已创建的 pm_*")
     confirm_data = confirm_payment(
         http, pk, session_id, pm_id, init_data, version, ctx, profile, log
     )
@@ -3168,8 +3281,6 @@ def stripe_to_paypal_redirect(
     _raise_for_current_paypal_risk_decline(confirm_data, pm_id)
     redirect_url = extract_redirect_url(confirm_data)
 
-    # PayPal requires a second confirm after ChatGPT approval; polling first
-    # normally leaves the page in requires_approval.
     if not redirect_url:
         sub = _find_submission_attempt(confirm_data)
         should_approve = str(sub.get("state") or "").lower() == "requires_approval"
@@ -3200,56 +3311,16 @@ def stripe_to_paypal_redirect(
                 raise RuntimeError(
                     "manual_approval approve blocked: result=blocked"
                 )
-            log("[stripe] approve 已通过，开始 PayPal re-confirm")
-            for confirm_attempt in range(1, 4):
-                try:
-                    confirm_again = confirm_payment(
-                        http,
-                        pk,
-                        session_id,
-                        pm_id,
-                        init_data,
-                        version,
-                        ctx,
-                        profile,
-                        log,
-                    )
-                    log(
-                        f"[stripe] approve re-confirm {confirm_attempt}/3 完整响应（已脱敏）: "
-                        + json.dumps(
-                            sanitize_diagnostic_payload(confirm_again),
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        )
-                    )
-                    _raise_for_current_paypal_risk_decline(confirm_again, pm_id)
-                    redirect_url = extract_redirect_url(confirm_again)
-                except PayPalRiskDeclinedError:
-                    raise
-                except PayPalFundingUnavailableError:
-                    raise
-                except Exception as exc:
-                    log(
-                        f"[stripe] approve re-confirm {confirm_attempt}/3 异常: "
-                        f"{type(exc).__name__}: {str(exc)[:180]}"
-                    )
-                    redirect_url = ""
-                if redirect_url:
-                    log(f"[stripe] approve re-confirm {confirm_attempt}/3 已取得 PayPal 跳转")
-                    break
-                if confirm_attempt < 3:
-                    time.sleep(1.5)
-            if not redirect_url:
-                log("[stripe] re-confirm 未取得 PayPal 跳转，poll payment_pages 兜底")
-                redirect_url = poll_redirect_after_approve(
-                    http,
-                    pk,
-                    session_id,
-                    log,
-                    max_attempts=45,
-                    phase="approve/re-confirm 后",
-                    payment_method_id=pm_id,
-                )
+            log("[stripe] approve 已通过，只轮询原 submission")
+            redirect_url = poll_redirect_after_approve(
+                http,
+                pk,
+                session_id,
+                log,
+                max_attempts=5,
+                phase="approve 后",
+                payment_method_id=pm_id,
+            )
         elif not should_approve:
             log("[stripe] confirm 已接受但暂无跳转，等待 Stripe 生成 PayPal redirect")
             redirect_url = poll_redirect_after_approve(
@@ -3257,7 +3328,7 @@ def stripe_to_paypal_redirect(
                 pk,
                 session_id,
                 log,
-                max_attempts=30,
+                max_attempts=5,
                 phase="confirm 后",
                 payment_method_id=pm_id,
             )

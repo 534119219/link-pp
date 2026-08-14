@@ -1,5 +1,14 @@
 FROM node:24-bookworm-slim AS node-runtime
 
+FROM golang:1.26-bookworm AS go-builder
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd ./cmd
+COPY internal ./internal
+RUN CGO_ENABLED=0 go build -trimpath -o /out/stripe-worker ./cmd/stripe-worker
+
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -10,6 +19,7 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 COPY --from=node-runtime /usr/local/ /usr/local/
+COPY --from=go-builder /out/stripe-worker /app/bin/stripe-worker
 
 RUN apt-get update \
     && apt-get install --no-install-recommends --yes ca-certificates curl \

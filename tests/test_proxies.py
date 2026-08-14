@@ -16,8 +16,8 @@ def test_parses_supported_url_schemes_and_aliases():
             ]
         )
     )
-    assert [item.scheme for item in endpoints] == ["socks5", "socks5", "http", "https"]
-    assert endpoints[0].safe_label == "socks5://proxy.example:1080"
+    assert [item.scheme for item in endpoints] == ["socks5h", "socks5h", "http", "https"]
+    assert endpoints[0].safe_label == "socks5h://proxy.example:1080"
     assert "user" not in endpoints[0].safe_label
 
 
@@ -27,8 +27,17 @@ def test_parses_host_port_user_password_in_required_order():
         default_scheme="socks5",
     )[0]
     assert endpoint.url == (
-        "socks5://USER-zone-custom-region-BR-session-1234:secret@us.rrp.example:10000"
+        "socks5h://USER-zone-custom-region-BR-session-1234:secret@us.rrp.example:10000"
     )
+
+
+def test_socks5_and_socks5h_deduplicate_to_remote_dns_route():
+    endpoints = parse_proxy_lines(
+        "socks5://user:pass@proxy.example:1080\n"
+        "socks5h://user:pass@proxy.example:1080"
+    )
+    assert len(endpoints) == 1
+    assert endpoints[0].scheme == "socks5h"
 
 
 def test_password_colon_is_encoded_and_duplicates_are_removed():

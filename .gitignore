@@ -8,6 +8,7 @@ __pycache__/
 .claude/
 .playwright-mcp/
 node_modules/
+bin/
 _confirm_dump.json
 data/
 diagnostics/

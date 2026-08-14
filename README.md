@@ -1,6 +1,6 @@
 # PayPal 0 元提链
 
-使用巴西代理出口和德国账单生成 0 元 OAICS Checkout，并提取 OAICS PayPal redirect 与
+使用指定代理出口和可独立选择的账单国家生成 0 元 Checkout，并提取 PayPal redirect 与
 PayPal Billing Agreement 链接。项目只负责提链，不注册 PayPal 用户、不处理短信
 验证码、不执行 PayPal 授权回调，也不等待付款结果。
 
@@ -21,6 +21,13 @@ PayPal Billing Agreement 链接。项目只负责提链，不注册 PayPal 用�
   -> 返回链接并停止
 ```
 
+默认执行上述 `oaics_` 流程。勾选“Stripe 链提炼”后改为严格的
+`cs_live_` Hosted Checkout 流程：前置优惠随首次 Checkout 请求提交，
+核验 Stripe `init` 应付金额为 0，然后执行
+`init -> elements -> confirm -> approve/re-confirm -> PayPal BA`。Stripe 模式可选择
+Python 或 Go 引擎，默认仍为 Python；Go 只处理 `cs_live_`/`cs_test_` Stripe Session，
+OAICS 继续由 Python 处理。两种模式和两个引擎都不会自动互相回退。
+
 只有 Checkout 实际返回 `cpmt_` 自定义支付方式时才使用
 `custom_payment_method/start` 兼容分支；空的 `custom_payment_methods` 不代表未开放
 PayPal，是否开放以 `payment_method_types` 为准。
@@ -31,20 +38,26 @@ OAICS confirm 持续 blocked、未返回 PayPal 方法或 Checkout 失效时，�
 立即停止并创建新单；其他短暂异常会在同一 Checkout 内更换代理重试。
 
 预检会先在同一 HTTP 会话预热 ChatGPT 页面/Cookie，再请求 `/backend-api/me`。
-Cloudflare Challenge、代理出口查询失败和连接中断最多在同一代理上重试一次，
-连接异常会重建会话并保留 Cookie；预检并发限制为 3 路，避免批量任务瞬时打满
-ChatGPT 边缘节点。相关状态码、`cf-ray`/`cf-mitigated` 等诊断字段只写入后端
-脱敏日志，不会消耗 Checkout 次数。
+Cloudflare Challenge、代理出口查询失败和连接中断不在同一代理上重试：预检请求
+默认最多等待 5 秒，失败后直接切换下一出口，且不消耗 Checkout 次数。预检并发默认
+20 路，可通过 `HANDOFF_PREFLIGHT_TIMEOUT` 和 `HANDOFF_PREFLIGHT_CONCURRENCY`
+调整。相关状态码、`cf-ray`/`cf-mitigated` 等诊断字段只写入后端脱敏日志。
 
 ## 输入
 
 - 单个 AT 或批量 AT
-- 代理出口国家与单代理池（巴西出口自动使用德国 DE/EUR 账单）
+- 代理出口国家与单代理池
+- 独立账单国家（默认巴西出口使用德国 DE/EUR，也可手动选择巴西 BR/USD 等国家）
+- OAICS 或 Stripe Hosted 提链模式
+- Stripe Hosted 的 Python/Go 执行引擎
 - Checkout 次数与每轮提链次数
 - 批量并发数
 
 支持 `socks5://`、`socks5h://`、`http://`、`https://`，也支持
-`host:port:user:password` 裸格式。
+`host:port:user:password` 裸格式。SOCKS5 输入会统一使用代理端 DNS（`socks5h`），
+避免本地 DNS 模式访问 ChatGPT 超时。
+
+Python 主链使用 Firefox 147 TLS/HTTP 指纹，并保持 UA、请求头和 Sentinel 上下文一致。
 
 ## 输出
 
@@ -72,18 +85,25 @@ POST /api/batches/<batch_id>/retry
 GET  /api/batches/<batch_id>/results.csv
 ```
 
+创建任务时，`country` 表示代理出口国家，`billing_country` 表示账单国家。例如
+`{"country":"BR","billing_country":"DE"}` 使用巴西出口和德国账单；将
+`billing_country` 改为 `BR` 即使用巴西出口和巴西账单。未传 `billing_country`
+时继续使用原有自动映射。
+
 批次看板使用 `compact=1` 获取轻量任务字段，并通过 `after_revision=<revision>`
 跳过未变化的完整响应。默认并发为 8，最大并发为 20。
 
 ## 本地运行
 
-需要 Python 3.12+ 和 Node.js 22.19+。
+需要 Python 3.12+、Node.js 22.19+ 和 Go 1.26+。
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 npm ci
+go build -o bin/stripe-worker ./cmd/stripe-worker
+export STRIPE_GO_WORKER="$PWD/bin/stripe-worker"
 python run.py
 ```
 
@@ -108,6 +128,8 @@ docker compose logs -f
 
 ```bash
 pytest -q
+go test ./...
+go vet ./...
 python3 -m compileall -q handoff run.py wsgi.py
 node --check handoff/static/app.js
 ```

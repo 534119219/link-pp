@@ -261,7 +261,7 @@
   const REGIONS = { "美洲": ["US","CA","BR","MX","AR","CL","CO","PE"], "欧洲": ["GB","DE","FR","ES","IT","NL","BE","IE","PT","AT","CH","SE","NO","DK","FI","PL","CZ","RO","HU","GR"], "亚太": ["JP","KR","SG","MY","TH","PH","ID","IN","TW","HK","AU","NZ"], "中东/非洲": ["IL","AE","ZA"] };
   const COUNTRY_FLAGS = {US:"🇺🇸",BR:"🇧🇷",GB:"🇬🇧",FR:"🇫🇷",DE:"🇩🇪",JP:"🇯🇵",CA:"🇨🇦",AU:"🇦🇺",NZ:"🇳🇿",MX:"🇲🇽",AR:"🇦🇷",CL:"🇨🇱",CO:"🇨🇴",PE:"🇵🇪",ES:"🇪🇸",IT:"🇮🇹",NL:"🇳🇱",BE:"🇧🇪",IE:"🇮🇪",PT:"🇵🇹",AT:"🇦🇹",CH:"🇨🇭",SE:"🇸🇪",NO:"🇳🇴",DK:"🇩🇰",FI:"🇫🇮",PL:"🇵🇱",CZ:"🇨🇿",RO:"🇷🇴",HU:"🇭🇺",GR:"🇬🇷",SG:"🇸🇬",MY:"🇲🇾",TH:"🇹🇭",PH:"🇵🇭",ID:"🇮🇩",IN:"🇮🇳",KR:"🇰🇷",TW:"🇹🇼",HK:"🇭🇰",IL:"🇮🇱",AE:"🇦🇪",ZA:"🇿🇦"};
 
-  function setupCountryPicker(pickerBtnId, labelId, codeInputId, dropdownId, searchId, listId, detailId, detailTextId) {
+  function setupCountryPicker(pickerBtnId, labelId, codeInputId, dropdownId, searchId, listId, detailId, detailTextId, onChange = null) {
     const btn = $(pickerBtnId);
     const label = $(labelId);
     const codeInput = $(codeInputId);
@@ -276,12 +276,10 @@
       codeInput.value = c.code;
       label.textContent = `${COUNTRY_FLAGS[c.code] || ""} ${c.name} (${c.code})`;
       if (detail && detailText) {
-        detailText.textContent = c.checkout_country === c.code
-          ? `${c.currency} · ${c.locale} · ${c.timezone} · ${c.processor_entity}`
-          : `${c.code} 出口 · ${c.checkout_country}/${c.checkout_currency} 账单`;
         detail.hidden = false;
       }
       dropdown.hidden = true;
+      if (onChange) onChange(c);
     }
 
     function renderList(query) {
@@ -314,8 +312,18 @@
     return setValue;
   }
 
-  const setCk = setupCountryPicker("ckPickerBtn","ckPickerLabel","ckCode","ckDropdown","ckSearch","ckList","ckDetail","ckDetailText");
+  function updateCountryDetail() {
+    const proxy = state.countries.get($("ckCode").value);
+    const billing = state.countries.get($("billingCode").value);
+    if (!proxy || !billing) return;
+    $("ckDetailText").textContent = `${proxy.code} 出口 · ${billing.code}/${billing.currency} 账单`;
+    $("ckDetail").hidden = false;
+  }
+
+  const setCk = setupCountryPicker("ckPickerBtn","ckPickerLabel","ckCode","ckDropdown","ckSearch","ckList","ckDetail","ckDetailText",updateCountryDetail);
   const setBCk = setupCountryPicker("bCkPickerBtn","bCkPickerLabel","bCkCode","bCkDropdown","bCkSearch","bCkList",null,null);
+  const setBilling = setupCountryPicker("billingPickerBtn","billingPickerLabel","billingCode","billingDropdown","billingSearch","billingList",null,null,updateCountryDetail);
+  const setBBilling = setupCountryPicker("bBillingPickerBtn","bBillingPickerLabel","bBillingCode","bBillingDropdown","bBillingSearch","bBillingList",null,null);
 
   // ─── Status ────────────────────────────────────────────────────────
   function setStatus(s, t) { $("statusChip").dataset.status = s; $("statusText").textContent = t; }
@@ -381,13 +389,18 @@
   function closeES() { state.es?.close(); state.es = null; }
 
   function singlePayload() {
-    if (!$("ckCode").value) throw new Error("请选择国家");
+    if (!$("ckCode").value) throw new Error("请选择代理出口国家");
+    if (!$("billingCode").value) throw new Error("请选择账单国家");
     if (!$("ckProxies").value.trim()) throw new Error("请填写代理");
     return {
       country: $("ckCode").value,
+      billing_country: $("billingCode").value,
       proxy_scheme: $("ckScheme").value,
       proxies: $("ckProxies").value,
       checkout_attempts: $("ckAttempts").value, provider_attempts: $("pvAttempts").value,
+      stripe_checkout: $("stripeCheckout").checked,
+      stripe_engine: $("stripeEngine").value,
+      stripe_promo_strategy: $("stripePromoStrategy").value,
     };
   }
 
@@ -491,13 +504,18 @@
 
   // ─── Batch Tab ─────────────────────────────────────────────────────
   function batchPayload() {
-    if (!$("bCkCode").value) throw new Error("请选择国家");
+    if (!$("bCkCode").value) throw new Error("请选择代理出口国家");
+    if (!$("bBillingCode").value) throw new Error("请选择账单国家");
     if (!$("bCkProxies").value.trim()) throw new Error("请填写代理");
     return {
       country: $("bCkCode").value,
+      billing_country: $("bBillingCode").value,
       proxy_scheme: $("bScheme").value,
       proxies: $("bCkProxies").value,
       checkout_attempts: $("bCkAttempts").value, provider_attempts: $("bPvAttempts").value,
+      stripe_checkout: $("bStripeCheckout").checked,
+      stripe_engine: $("bStripeEngine").value,
+      stripe_promo_strategy: $("bStripePromoStrategy").value,
     };
   }
 
@@ -875,7 +893,9 @@
     try {
       localStorage.setItem(PREFS_KEY, JSON.stringify({
         country: $("ckCode").value,
+        billingCountry: $("billingCode").value,
         batchCountry: $("bCkCode").value,
+        batchBillingCountry: $("bBillingCode").value,
         proxyScheme: $("ckScheme").value,
         batchProxyScheme: $("bScheme").value,
         proxies: $("ckProxies").value,
@@ -883,6 +903,12 @@
         ckAttempts: $("ckAttempts").value, pvAttempts: $("pvAttempts").value,
         bCkAttempts: $("bCkAttempts").value, bPvAttempts: $("bPvAttempts").value,
         bConcurrency: $("bConcurrency").value,
+        stripeCheckout: $("stripeCheckout").checked,
+        bStripeCheckout: $("bStripeCheckout").checked,
+        stripeEngine: $("stripeEngine").value,
+        bStripeEngine: $("bStripeEngine").value,
+        stripePromoStrategy: $("stripePromoStrategy").value,
+        bStripePromoStrategy: $("bStripePromoStrategy").value,
       }));
     } catch {}
   }
@@ -894,6 +920,8 @@
         ...p,
         country: p.country || p.ckCode || "",
         batchCountry: p.batchCountry || p.bCkCode || p.country || p.ckCode || "",
+        billingCountry: p.billingCountry || p.checkoutCountry || "",
+        batchBillingCountry: p.batchBillingCountry || p.billingCountry || p.checkoutCountry || "",
         proxyScheme: p.proxyScheme || p.ckScheme || "",
         batchProxyScheme: p.batchProxyScheme || p.proxyScheme || p.ckScheme || "",
         proxies: p.proxies || p.ckProxies || "",
@@ -908,6 +936,12 @@
       if (p.bCkAttempts) $("bCkAttempts").value = p.bCkAttempts;
       if (p.bPvAttempts) $("bPvAttempts").value = p.bPvAttempts;
       if (p.bConcurrency) $("bConcurrency").value = p.bConcurrency;
+      $("stripeCheckout").checked = p.stripeCheckout === true;
+      $("bStripeCheckout").checked = p.bStripeCheckout === true;
+      $("stripeEngine").value = ["python", "go"].includes(p.stripeEngine) ? p.stripeEngine : "python";
+      $("bStripeEngine").value = ["python", "go"].includes(p.bStripeEngine) ? p.bStripeEngine : "python";
+      $("stripePromoStrategy").value = ["upfront", "post_update", "mixed"].includes(p.stripePromoStrategy) ? p.stripePromoStrategy : "post_update";
+      $("bStripePromoStrategy").value = ["upfront", "post_update", "mixed"].includes(p.bStripePromoStrategy) ? p.bStripePromoStrategy : "post_update";
       return normalized;
     } catch { return null; }
   }
@@ -918,7 +952,7 @@
     clearTimeout(prefsTimer);
     prefsTimer = setTimeout(savePrefs, 250);
   };
-  ["ckScheme","bScheme","ckProxies","bCkProxies","ckAttempts","pvAttempts","bCkAttempts","bPvAttempts","bConcurrency"].forEach(id => {
+  ["ckScheme","bScheme","ckProxies","bCkProxies","ckAttempts","pvAttempts","bCkAttempts","bPvAttempts","bConcurrency","stripeCheckout","bStripeCheckout","stripeEngine","bStripeEngine","stripePromoStrategy","bStripePromoStrategy"].forEach(id => {
     $(id).addEventListener("change", savePrefs);
     if ($(id).tagName === "TEXTAREA") $(id).addEventListener("input", scheduleSavePrefs);
   });
@@ -926,13 +960,29 @@
   // ─── Init ──────────────────────────────────────────────────────────
   const prefs = loadPrefs();
 
+  function syncStripeEngine(checkId, engineId, promoId) {
+    $(engineId).disabled = !$(checkId).checked;
+    $(promoId).disabled = !$(checkId).checked;
+  }
+  $("stripeCheckout").addEventListener("change", () => syncStripeEngine("stripeCheckout", "stripeEngine", "stripePromoStrategy"));
+  $("bStripeCheckout").addEventListener("change", () => syncStripeEngine("bStripeCheckout", "bStripeEngine", "bStripePromoStrategy"));
+  syncStripeEngine("stripeCheckout", "stripeEngine", "stripePromoStrategy");
+  syncStripeEngine("bStripeCheckout", "bStripeEngine", "bStripePromoStrategy");
+
   api("/api/meta").then(meta => {
     state.meta = meta;
     meta.countries.forEach(c => state.countries.set(c.code, c));
     // Set defaults
     const ckDefault = prefs?.country || meta.defaults.country;
-    setCk(state.countries.get(ckDefault));
-    setBCk(state.countries.get(prefs?.batchCountry || ckDefault));
+    const batchCountryDefault = prefs?.batchCountry || ckDefault;
+    const ckCountry = state.countries.get(ckDefault);
+    const batchCountry = state.countries.get(batchCountryDefault);
+    setCk(ckCountry);
+    setBCk(batchCountry);
+    const billingDefault = prefs?.billingCountry || ckCountry?.checkout_country || meta.defaults.billing_country || meta.defaults.checkout_country;
+    const batchBillingDefault = prefs?.batchBillingCountry || batchCountry?.checkout_country || billingDefault;
+    setBilling(state.countries.get(billingDefault));
+    setBBilling(state.countries.get(batchBillingDefault));
     if (!prefs?.proxyScheme) $("ckScheme").value = meta.defaults.proxy_scheme;
     if (!prefs?.batchProxyScheme) $("bScheme").value = meta.defaults.proxy_scheme;
     if (!prefs) {
@@ -941,6 +991,10 @@
       $("bCkAttempts").value = meta.defaults.checkout_attempts;
       $("bPvAttempts").value = meta.defaults.provider_attempts;
       $("bConcurrency").value = meta.defaults.batch_concurrency;
+      $("stripeEngine").value = meta.defaults.stripe_engine || "python";
+      $("bStripeEngine").value = meta.defaults.stripe_engine || "python";
+      $("stripePromoStrategy").value = meta.defaults.stripe_promo_strategy || "post_update";
+      $("bStripePromoStrategy").value = meta.defaults.stripe_promo_strategy || "post_update";
     }
     $("bConcurrency").max = meta.max_batch_concurrency;
     // Render proxy previews for restored values

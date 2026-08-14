@@ -7,6 +7,7 @@ from typing import Callable, Protocol
 from .countries import CountryProfile
 from .gateway import CheckoutArtifact, ProviderResult, new_device_id
 from .proxies import ProxyPool
+from .protocol.go_stripe_worker import GoStripeWorkerUnavailableError
 from .protocol.stripe_checkout import (
     ChatGPTAuthError,
     CheckoutPreflightError,
@@ -47,6 +48,9 @@ class RunSpec:
     proxies: ProxyPool
     checkout_attempts: int = DEFAULT_CHECKOUT_ATTEMPTS
     provider_attempts: int = DEFAULT_PROVIDER_ATTEMPTS
+    stripe_checkout: bool = False
+    stripe_engine: str = "python"
+    stripe_promo_strategy: str = "post_update"
     device_id: str = ""
     proxy_offset: int = 0
 
@@ -125,6 +129,8 @@ def _short_reason(exc: BaseException, access_token: str) -> str:
         return "Checkout 已失效"
     if "普通 stripe checkout" in lower or "oaics_ 链" in lower:
         return "上游返回普通 Stripe Checkout，未生成 oaics_ 链"
+    if "未生成当前流程需要的 cs_live_ 链" in lower:
+        return "上游返回 OAICS Checkout，未生成 cs_live_ 链"
     if (
         "manual_approval approve blocked" in lower
         or "result=blocked" in lower
@@ -142,6 +148,8 @@ def _short_reason(exc: BaseException, access_token: str) -> str:
         or "stripe due=" in lower
         or "checkout due=" in lower
     ):
+        if re.search(r"session=cs_(?:live|test)_", lower):
+            return "已生成 Stripe Checkout，但前置优惠未生效（应付金额非 0）"
         return "已生成 OAICS，但前置优惠未生效（应付金额非 0）"
     if "ba 链接" in lower or "ba_token" in lower:
         return "没有解析到 BA 链接"
@@ -149,6 +157,8 @@ def _short_reason(exc: BaseException, access_token: str) -> str:
         return "未取得 PayPal 跳转地址"
     if "bad_decrypt" in lower:
         return "代理 TLS 解密异常（BAD_DECRYPT）"
+    if "general socks server failure" in lower:
+        return "代理无法连接 Stripe（SOCKS server failure）"
     if "connection closed abruptly" in lower or re.search(r"curl\s*:\s*\(56\)", lower):
         return "代理连接被上游中断（curl 56）"
     network_markers = (
@@ -235,6 +245,10 @@ class HandoffEngine:
                     billing=billing,
                     proxy=checkout_proxy,
                     device_id=device_id,
+                    stripe_checkout=spec.stripe_checkout,
+                    stripe_engine=spec.stripe_engine,
+                    stripe_promo_strategy=spec.stripe_promo_strategy,
+                    checkout_attempt=displayed_attempt,
                     log=lambda message: emit(
                         "info",
                         "checkout",
@@ -271,7 +285,15 @@ class HandoffEngine:
 
             checkout_attempt += 1
             consecutive_preflight_failures = 0
-            emit("success", "checkout", f"0 元已确认 · {mask_identifier(artifact.session_id)}")
+            if artifact.session_id.startswith(("cs_live_", "cs_test_")):
+                checkout_status = "Stripe Checkout 已生成"
+            else:
+                checkout_status = "0 元已确认"
+            emit(
+                "success",
+                "checkout",
+                f"{checkout_status} · {mask_identifier(artifact.session_id)}",
+            )
 
             for provider_attempt in range(1, spec.provider_attempts + 1):
                 check_cancelled()
@@ -309,11 +331,17 @@ class HandoffEngine:
                         ),
                     )
                     if not result.paypal_approve_url or not result.ba_token:
-                        raise RuntimeError("未能从 OAICS 跳转解析 PayPal BA 链接")
+                        raise RuntimeError("未能从 Checkout 跳转解析 PayPal BA 链接")
                 except CancelledError:
                     raise
                 except Exception as exc:
                     last_error = exc
+                    if isinstance(exc, GoStripeWorkerUnavailableError):
+                        reason = _short_reason(exc, token)
+                        last_provider_error = exc
+                        emit("error", "extract", reason)
+                        close_active_artifact()
+                        raise RuntimeError(reason) from exc
                     raw_error = str(exc).lower()
                     is_transport_noise = (
                         _short_reason(exc, token) in {"代理连接失败", "代理连接被上游中断（curl 56）"}

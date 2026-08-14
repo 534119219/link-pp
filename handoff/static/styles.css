@@ -151,6 +151,14 @@ select.input { padding-right: 32px; }
 .w-140 { width: 140px; flex-shrink: 0; }
 .field-meta { margin-top: 6px; font-size: 12px; color: var(--text-muted); }
 .field-hint { font-weight: 400; color: var(--text-muted); margin-left: 6px; }
+.check-option {
+  display: flex; align-items: center; gap: 9px; width: fit-content;
+  color: var(--text); font-size: 13px; font-weight: 600; cursor: pointer;
+}
+.check-option input {
+  width: 16px; height: 16px; margin: 0; accent-color: var(--accent); cursor: pointer;
+}
+.stripe-engine-field { margin-top: 12px; }
 
 /* ═══ Buttons ═══ */
 .btn {

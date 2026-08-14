@@ -6,8 +6,11 @@ from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 SUPPORTED_PROXY_SCHEMES = ("socks5", "socks5h", "http", "https")
 _SCHEME_ALIASES = {
-    "socket5": "socks5",
-    "socks": "socks5",
+    # curl distinguishes local-DNS socks5 from proxy-DNS socks5h. The proxy
+    # pools used here reach ChatGPT reliably only when the proxy resolves it.
+    "socket5": "socks5h",
+    "socks": "socks5h",
+    "socks5": "socks5h",
 }
 
 

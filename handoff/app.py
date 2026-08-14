@@ -37,11 +37,32 @@ def _parse_shared_run_config(payload: dict) -> dict:
     proxy_country = get_country(
         payload.get("country") or payload.get("proxy_country", "")
     )
-    checkout_country = checkout_country_for_proxy(proxy_country)
+    requested_billing_country = payload.get("billing_country") or payload.get(
+        "checkout_country"
+    )
+    checkout_country = (
+        get_country(requested_billing_country)
+        if requested_billing_country
+        else checkout_country_for_proxy(proxy_country)
+    )
     proxy_text = payload.get("proxies")
     if proxy_text is None:
         proxy_text = payload.get("checkout_proxies")
     proxy_scheme = payload.get("proxy_scheme") or payload.get("checkout_proxy_scheme")
+    stripe_checkout = _boolean_option(
+        payload.get("stripe_checkout"),
+        name="stripe_checkout",
+    )
+    stripe_engine = str(payload.get("stripe_engine") or "python").strip().lower()
+    if stripe_engine not in {"python", "go"}:
+        raise ValueError("stripe_engine 只支持 python 或 go")
+    if stripe_engine == "go" and not stripe_checkout:
+        raise ValueError("Go 引擎当前只支持 Stripe 链提炼")
+    stripe_promo_strategy = str(
+        payload.get("stripe_promo_strategy") or "post_update"
+    ).strip().lower()
+    if stripe_promo_strategy not in {"upfront", "post_update", "mixed"}:
+        raise ValueError("stripe_promo_strategy 只支持 upfront、post_update 或 mixed")
     return {
         "proxy_country": proxy_country,
         "checkout_country": checkout_country,
@@ -59,7 +80,26 @@ def _parse_shared_run_config(payload: dict) -> dict:
             payload.get("provider_attempts"),
             default=DEFAULT_PROVIDER_ATTEMPTS,
         ),
+        "stripe_checkout": stripe_checkout,
+        "stripe_engine": stripe_engine,
+        "stripe_promo_strategy": stripe_promo_strategy,
     }
+
+
+def _boolean_option(value: object, *, name: str) -> bool:
+    if value is None or value == "":
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    raise ValueError(f"{name} 必须是布尔值")
 
 
 def _build_run_spec(access_token: object, shared: dict) -> RunSpec:
@@ -162,13 +202,19 @@ def create_app(config: dict | None = None, *, gateway=None) -> Flask:
             {
                 "countries": list_countries(),
                 "proxy_schemes": list(SUPPORTED_PROXY_SCHEMES),
+                "stripe_engines": ["python", "go"],
+                "stripe_promo_strategies": ["upfront", "post_update", "mixed"],
                 "defaults": {
                     "country": "BR",
+                    "billing_country": "DE",
                     "checkout_country": "DE",
                     "checkout_attempts": DEFAULT_CHECKOUT_ATTEMPTS,
                     "provider_attempts": DEFAULT_PROVIDER_ATTEMPTS,
                     "batch_concurrency": default_batch_concurrency,
                     "proxy_scheme": "socks5",
+                    "stripe_checkout": False,
+                    "stripe_engine": "python",
+                    "stripe_promo_strategy": "post_update",
                 },
                 "retention_seconds": manager.retention_seconds,
                 "job_workers": manager.max_workers,

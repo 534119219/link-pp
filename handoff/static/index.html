@@ -91,6 +91,20 @@
                   <span id="ckDetailText"></span>
                 </div>
                 <div class="field">
+                  <label>账单国家</label>
+                  <div class="country-picker" id="billingPicker">
+                    <button type="button" class="picker-btn" id="billingPickerBtn">
+                      <span class="picker-label" id="billingPickerLabel">选择国家</span>
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+                    </button>
+                    <input type="hidden" name="billing_country" id="billingCode">
+                    <div class="picker-dropdown" id="billingDropdown" hidden>
+                      <input type="search" class="picker-search" id="billingSearch" placeholder="搜索账单国家、货币..." autocomplete="off" spellcheck="false">
+                      <div class="picker-list" id="billingList"></div>
+                    </div>
+                  </div>
+                </div>
+                <div class="field">
                   <label>代理列表</label>
                   <textarea id="ckProxies" name="proxies" class="input textarea mono" rows="4" spellcheck="false" placeholder="每行一个，支持 URL / host:port:user:pass / host:port 格式"></textarea>
                 </div>
@@ -114,6 +128,25 @@
                     <label>提链/轮</label>
                     <input id="pvAttempts" name="provider_attempts" type="number" class="input" min="1" value="10">
                   </div>
+                </div>
+                <label class="check-option" for="stripeCheckout">
+                  <input id="stripeCheckout" name="stripe_checkout" type="checkbox">
+                  <span>Stripe 链提炼</span>
+                </label>
+                <div class="field stripe-engine-field">
+                  <label for="stripeEngine">Stripe 引擎</label>
+                  <select id="stripeEngine" name="stripe_engine" class="input" disabled>
+                    <option value="python">Python</option>
+                    <option value="go">Go</option>
+                  </select>
+                </div>
+                <div class="field stripe-engine-field">
+                  <label for="stripePromoStrategy">优惠策略</label>
+                  <select id="stripePromoStrategy" name="stripe_promo_strategy" class="input" disabled>
+                    <option value="upfront">前置优惠</option>
+                    <option value="post_update" selected>后置 update 优惠</option>
+                    <option value="mixed">混合优惠</option>
+                  </select>
                 </div>
                 <div class="action-row">
                   <button class="btn btn-primary btn-lg" id="singleStartBtn" type="submit">开始提链</button>
@@ -229,6 +262,17 @@
                   </div>
                 </div>
                 <div class="field">
+                  <label>账单国家</label>
+                  <div class="country-picker" id="bBillingPicker">
+                    <button type="button" class="picker-btn" id="bBillingPickerBtn"><span class="picker-label" id="bBillingPickerLabel">选择国家</span><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg></button>
+                    <input type="hidden" name="billing_country" id="bBillingCode">
+                    <div class="picker-dropdown" id="bBillingDropdown" hidden>
+                      <input type="search" class="picker-search" id="bBillingSearch" placeholder="搜索账单国家、货币..." autocomplete="off" spellcheck="false">
+                      <div class="picker-list" id="bBillingList"></div>
+                    </div>
+                  </div>
+                </div>
+                <div class="field">
                   <label>代理列表</label>
                   <textarea id="bCkProxies" name="proxies" class="input textarea mono" rows="4" spellcheck="false" placeholder="每行一个，支持 URL / host:port:user:pass / host:port 格式"></textarea>
                 </div>
@@ -236,6 +280,25 @@
                   <div class="field"><label>Checkout</label><input id="bCkAttempts" type="number" class="input" min="1" value="5"></div>
                   <div class="field"><label>提链/轮</label><input id="bPvAttempts" type="number" class="input" min="1" value="10"></div>
                   <div class="field"><label>并发</label><input id="bConcurrency" type="number" class="input" min="1" max="20" value="8"></div>
+                </div>
+                <label class="check-option" for="bStripeCheckout">
+                  <input id="bStripeCheckout" type="checkbox">
+                  <span>Stripe 链提炼</span>
+                </label>
+                <div class="field stripe-engine-field">
+                  <label for="bStripeEngine">Stripe 引擎</label>
+                  <select id="bStripeEngine" class="input" disabled>
+                    <option value="python">Python</option>
+                    <option value="go">Go</option>
+                  </select>
+                </div>
+                <div class="field stripe-engine-field">
+                  <label for="bStripePromoStrategy">优惠策略</label>
+                  <select id="bStripePromoStrategy" class="input" disabled>
+                    <option value="upfront">前置优惠</option>
+                    <option value="post_update" selected>后置 update 优惠</option>
+                    <option value="mixed">混合优惠</option>
+                  </select>
                 </div>
                 <div class="action-row">
                   <button class="btn btn-primary btn-lg" id="batchStartBtn" type="submit">开始批量</button>

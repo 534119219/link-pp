@@ -16,10 +16,12 @@ from handoff.engine import (
 )
 from handoff.gateway import CheckoutArtifact, ProviderResult
 from handoff.proxies import ProxyPool, parse_proxy_lines
+from handoff.protocol.go_stripe_worker import GoStripeWorkerUnavailableError
 from handoff.protocol.stripe_checkout import (
     CheckoutPreflightError,
     PayPalFundingUnavailableError,
 )
+from handoff.protocol import stripe_checkout as stripe
 from handoff.security import TokenProfile
 
 
@@ -57,7 +59,14 @@ class FakeGateway:
         raise RuntimeError("manual_approval approve blocked: result=blocked")
 
 
-def make_spec(*, checkout_attempts=5, provider_attempts=10):
+def make_spec(
+    *,
+    checkout_attempts=5,
+    provider_attempts=10,
+    stripe_checkout=False,
+    stripe_engine="python",
+    stripe_promo_strategy="post_update",
+):
     return RunSpec(
         access_token="secret-at",
         token_profile=TokenProfile("owner@example.com", "Owner", "acct"),
@@ -66,6 +75,9 @@ def make_spec(*, checkout_attempts=5, provider_attempts=10):
         proxies=ProxyPool(parse_proxy_lines("checkout-a:1001\ncheckout-b:1002")),
         checkout_attempts=checkout_attempts,
         provider_attempts=provider_attempts,
+        stripe_checkout=stripe_checkout,
+        stripe_engine=stripe_engine,
+        stripe_promo_strategy=stripe_promo_strategy,
     )
 
 
@@ -120,6 +132,27 @@ def test_provider_success_returns_links_without_payment_state():
     assert provider_call["checkout_country"].code == "DE"
     assert provider_call["billing"]["address"]["country"] == "DE"
     assert "payment_completed" not in result.to_dict()
+
+
+def test_stripe_mode_is_forwarded_to_checkout_gateway():
+    gateway = FakeGateway(provider_behavior=lambda _number, _kwargs: success_result())
+
+    HandoffEngine(gateway).run(
+        make_spec(
+            checkout_attempts=1,
+            provider_attempts=1,
+            stripe_checkout=True,
+            stripe_engine="go",
+            stripe_promo_strategy="mixed",
+        ),
+        emit=lambda *_item: None,
+        is_cancelled=lambda: False,
+    )
+
+    assert gateway.checkout_calls[0]["stripe_checkout"] is True
+    assert gateway.checkout_calls[0]["stripe_engine"] == "go"
+    assert gateway.checkout_calls[0]["stripe_promo_strategy"] == "mixed"
+    assert gateway.checkout_calls[0]["checkout_attempt"] == 1
 
 
 def test_route_log_distinguishes_brazil_exit_from_german_billing():
@@ -182,6 +215,26 @@ def test_access_token_is_redacted_from_logs_and_errors():
     assert token not in repr(logs) + str(captured.value)
 
 
+def test_missing_go_worker_stops_without_proxy_exhaustion_message():
+    logs = []
+    gateway = FakeGateway(
+        provider_behavior=lambda _number, _kwargs: (_ for _ in ()).throw(
+            GoStripeWorkerUnavailableError("Go Stripe Worker 不存在: /project/bin/stripe-worker")
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="Go Stripe Worker 不存在"):
+        HandoffEngine(gateway).run(
+            make_spec(checkout_attempts=5, provider_attempts=3),
+            emit=lambda *item: logs.append(item),
+            is_cancelled=lambda: False,
+        )
+
+    assert len(gateway.checkout_calls) == 1
+    assert len(gateway.provider_calls) == 1
+    assert not any("代理出口已用完" in message for _level, _stage, message in logs)
+
+
 def test_final_error_keeps_confirmed_paypal_unavailable_over_later_tls_noise():
     def checkout_behavior(number, _kwargs):
         if number == 2:
@@ -232,6 +285,20 @@ def test_attempt_validation_and_short_reasons():
             "",
         )
         == "已生成 OAICS，但前置优惠未生效（应付金额非 0）"
+    )
+    assert (
+        _short_reason(
+            RuntimeError("免费促销未实际生效 (session=cs_live_test, Stripe due=2300 EUR)"),
+            "",
+        )
+        == "已生成 Stripe Checkout，但前置优惠未生效（应付金额非 0）"
+    )
+    assert (
+        _short_reason(
+            stripe.StripeCheckoutRequiredError("oaics_wrong_kind"),
+            "",
+        )
+        == "上游返回 OAICS Checkout，未生成 cs_live_ 链"
     )
     assert (
         _short_reason(
