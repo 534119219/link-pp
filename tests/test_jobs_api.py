@@ -172,6 +172,8 @@ def test_meta_and_frontend_only_expose_link_extraction():
     assert meta["defaults"]["billing_country"] == "DE"
     assert meta["defaults"]["checkout_country"] == "DE"
     assert meta["defaults"]["batch_concurrency"] == 8
+    assert meta["job_workers"] == 200
+    assert "max_batch_concurrency" not in meta
     assert meta["defaults"]["stripe_checkout"] is False
     assert meta["defaults"]["stripe_engine"] == "python"
     assert meta["defaults"]["stripe_promo_strategy"] == "post_update"
@@ -383,18 +385,18 @@ def test_batch_failed_items_retry_without_resubmitting_tokens():
     app.extensions["job_manager"].shutdown()
 
 
-def test_batch_concurrency_limit_is_enforced():
-    tokens = [make_token(email=f"worker{index}@example.com") for index in range(5)]
+def test_batch_concurrency_above_twenty_is_not_capped():
+    tokens = [make_token(email=f"worker{index}@example.com") for index in range(25)]
     gateway = SlowGateway()
-    app = create_app({"TESTING": True, "JOB_WORKERS": 5}, gateway=gateway)
+    app = create_app({"TESTING": True, "JOB_WORKERS": 25}, gateway=gateway)
     client = app.test_client()
     request = payload(tokens[0])
     request.pop("access_token")
-    request.update({"access_tokens": tokens, "concurrency": 2})
+    request.update({"access_tokens": tokens, "concurrency": 25})
     batch_id = client.post("/api/batches", json=request).get_json()["id"]
     wait_for_batch(client, batch_id)
-    assert gateway.max_active == 2
-    request["concurrency"] = 21
+    assert gateway.max_active == 25
+    request["concurrency"] = 0
     assert client.post("/api/batches", json=request).status_code == 400
     app.extensions["job_manager"].shutdown()
 

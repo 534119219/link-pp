@@ -24,7 +24,6 @@ from .security import normalize_access_token, token_profile
 
 DEFAULT_MAX_BATCH_ITEMS = 200
 DEFAULT_BATCH_CONCURRENCY = 8
-MAX_BATCH_CONCURRENCY = 20
 
 
 def _proxy_text(value: object) -> str:
@@ -122,15 +121,15 @@ def _batch_token_lines(value: object) -> list[tuple[int, str]]:
     return items
 
 
-def _batch_concurrency(value: object, *, default: int, maximum: int) -> int:
+def _batch_concurrency(value: object, *, default: int) -> int:
     if value is None or value == "":
         return default
     try:
         concurrency = int(value)
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError("批次并发必须是整数") from exc
-    if concurrency < 1 or concurrency > maximum:
-        raise ValueError(f"批次并发必须在 1 到 {maximum} 之间")
+    if concurrency < 1:
+        raise ValueError("批次并发必须至少为 1")
     return concurrency
 
 
@@ -160,24 +159,14 @@ def create_app(config: dict | None = None, *, gateway=None) -> Flask:
         1,
         int(app.config.get("MAX_BATCH_ITEMS", DEFAULT_MAX_BATCH_ITEMS)),
     )
-    max_batch_concurrency = max(
-        1,
-        min(
-            MAX_BATCH_CONCURRENCY,
-            int(app.config.get("MAX_BATCH_CONCURRENCY", MAX_BATCH_CONCURRENCY)),
-        ),
-    )
     default_batch_concurrency = max(
         1,
-        min(
-            max_batch_concurrency,
-            int(app.config.get("DEFAULT_BATCH_CONCURRENCY", DEFAULT_BATCH_CONCURRENCY)),
-        ),
+        int(app.config.get("DEFAULT_BATCH_CONCURRENCY", DEFAULT_BATCH_CONCURRENCY)),
     )
     engine = HandoffEngine(gateway or LiveProtocolGateway())
     manager = JobManager(
         engine,
-        max_workers=max(1, int(app.config.get("JOB_WORKERS", MAX_BATCH_CONCURRENCY))),
+        max_workers=max(1, int(app.config.get("JOB_WORKERS", max_batch_items))),
         retention_seconds=int(app.config.get("JOB_RETENTION_SECONDS", 3600)),
         diagnostic_dir=app.config.get("DIAGNOSTIC_DIR")
         or os.environ.get("HANDOFF_DIAGNOSTIC_DIR")
@@ -219,7 +208,6 @@ def create_app(config: dict | None = None, *, gateway=None) -> Flask:
                 "retention_seconds": manager.retention_seconds,
                 "job_workers": manager.max_workers,
                 "max_batch_items": max_batch_items,
-                "max_batch_concurrency": max_batch_concurrency,
             }
         )
 
@@ -248,7 +236,6 @@ def create_app(config: dict | None = None, *, gateway=None) -> Flask:
             concurrency = _batch_concurrency(
                 payload.get("concurrency"),
                 default=default_batch_concurrency,
-                maximum=max_batch_concurrency,
             )
             shared = _parse_shared_run_config(payload)
             items: list[tuple[str, RunSpec]] = []

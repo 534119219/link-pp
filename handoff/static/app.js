@@ -996,7 +996,6 @@
       $("stripePromoStrategy").value = meta.defaults.stripe_promo_strategy || "post_update";
       $("bStripePromoStrategy").value = meta.defaults.stripe_promo_strategy || "post_update";
     }
-    $("bConcurrency").max = meta.max_batch_concurrency;
     // Render proxy previews for restored values
     if ($("ckProxies").value) renderProxyPreview("ckProxies","ckProxyBody","ckProxyPreview","ckCount",$("ckScheme").value);
   }).catch(err => toast("加载配置失败: " + err.message, "error"));

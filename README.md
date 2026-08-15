@@ -128,7 +128,9 @@ Stripe 任务另外传入 `stripe_checkout=true`，`stripe_engine` 支持 `pytho
 ```
 
 批次看板使用 `compact=1` 获取轻量任务字段，并通过 `after_revision=<revision>`
-跳过未变化的完整响应。默认并发为 8，最大并发为 20。
+跳过未变化的完整响应。默认并发为 8，并发参数不设应用层上限；实际同时
+执行数受批次任务数、服务器资源和可选的 `JOB_WORKERS` 部署配置影响。未配置
+`JOB_WORKERS` 时，线程池容量与单批最大任务数一致，默认为 200。
 
 ## 本地运行
 
